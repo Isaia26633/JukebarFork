@@ -1,4 +1,3 @@
-
 const express = require('express');
 const router = express.Router();
 const { getOwnerIds } = require('../utils/owners');
@@ -11,17 +10,17 @@ async function checkAndResetLeaderboard(app) {
     try {
         const now = new Date();
         const lastReset = new Date(app.get('leaderboardLastReset') || 0);
-        
+
         // Calculate the start of this week (Monday at midnight)
         const startOfThisWeek = new Date(now);
         const currentDay = now.getDay(); // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
         const daysToSubtract = currentDay === 0 ? 6 : currentDay - 1;
         startOfThisWeek.setDate(now.getDate() - daysToSubtract);
         startOfThisWeek.setHours(0, 0, 0, 0);
-        
+
         // Reset is needed if last reset was before this week's Monday
         const needsReset = lastReset < startOfThisWeek;
-        
+
         if (needsReset) {
             const resetTime = Date.now();
             app.set('leaderboardLastReset', resetTime);
@@ -36,7 +35,7 @@ async function checkAndResetLeaderboard(app) {
                     resolve();
                 });
             });
-            
+
             console.log('Leaderboard automatically reset for the new week!');
             return true;
         }
@@ -51,15 +50,15 @@ async function checkAndResetLeaderboard(app) {
 function startResetScheduler(app) {
     if (resetIntervalStarted) return;
     resetIntervalStarted = true;
-    
+
     // Check immediately on startup
     checkAndResetLeaderboard(app);
-    
+
     // Then check every minute
     setInterval(() => {
         checkAndResetLeaderboard(app);
     }, 60000); // Check every minute
-    
+
     console.log('Leaderboard auto-reset scheduler started');
 }
 
@@ -78,7 +77,7 @@ router.get('/api/leaderboard', async (req, res) => {
             : '';
         const leaderboardData = await new Promise((resolve, reject) => {
             db.all(
-                `SELECT displayName, COALESCE(songsPlayed, 0) as songsPlayed, COALESCE(isBanned, 0) as isBanned FROM users ${exclusion} ORDER BY songsPlayed DESC`,
+                `SELECT displayName, COALESCE(songsPlayed, 0) as songsPlayed, COALESCE(isBanned, 0) as isBanned FROM users ${exclusion} ${exclusion ? 'AND' : 'WHERE'} songsPlayed > 0 ORDER BY songsPlayed DESC`,
                 ownerIds,
                 (err, rows) => {
                     if (err) return reject(err);
@@ -97,17 +96,17 @@ router.get('/api/leaderboard/update', async (req, res) => {
     try {
         const now = new Date();
         const lastReset = new Date(req.app.get('leaderboardLastReset') || 0);
-        
+
         // Calculate the start of this week (Monday at midnight)
         const startOfThisWeek = new Date(now);
         const currentDay = now.getDay();
         const daysToSubtract = currentDay === 0 ? 6 : currentDay - 1;
         startOfThisWeek.setDate(now.getDate() - daysToSubtract);
         startOfThisWeek.setHours(0, 0, 0, 0);
-        
+
         // Reset is needed if last reset was before this week's Monday
         const needsReset = lastReset < startOfThisWeek;
-        
+
         if (needsReset) {
             const resetTime = Date.now();
             req.app.set('leaderboardLastReset', resetTime);
@@ -128,8 +127,8 @@ router.get('/api/leaderboard/update', async (req, res) => {
             // Calculate next Monday
             const nextMonday = new Date(startOfThisWeek);
             nextMonday.setDate(startOfThisWeek.getDate() + 7);
-            res.json({ 
-                ok: false, 
+            res.json({
+                ok: false,
                 message: "Leaderboard reset not needed at this time.",
                 nextReset: nextMonday.toDateString()
             });
