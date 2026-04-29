@@ -1,29 +1,4 @@
 const { isJukepixEnabled } = require('./jukepix');
-
-/** Spotify queue/currently-playing items may be tracks or episodes */
-function artistStringFromMedia(item) {
-    if (!item) return 'Unknown Artist';
-    const uri = item.uri || '';
-    const isEpisode = item.type === 'episode' || uri.startsWith('spotify:episode:');
-    if (item.artists && item.artists.length) {
-        return item.artists.map((a) => a.name).join(', ');
-    }
-    if (isEpisode && item.show?.publisher) {
-        return item.show.publisher;
-    }
-    return 'Unknown Artist';
-}
-
-function imageUrlFromMedia(item) {
-    if (!item) return null;
-    return (
-        item.album?.images?.[0]?.url ??
-        item.images?.[0]?.url ??
-        item.show?.images?.[0]?.url ??
-        null
-    );
-}
-
 class QueueManager {
     constructor() {
         this.currentTrack = null;
@@ -274,27 +249,191 @@ class QueueManager {
         this.clients.delete(ws);
     }
 
-    // Initialize queue from Spotify on startup — same REST path as syncWithSpotify (parallel queue + playback).
+    // Initialize queue from Spotify on startup
     async initializeFromSpotify(spotifyApi) {
         console.log('initializeFromSpotify() called');
         try {
+            console.log('Fetching current Spotify queue...');
+
+            // Ensure we have a valid access token
             const { ensureSpotifyAccessToken } = require('./spotify');
             await ensureSpotifyAccessToken();
 
-            await this.syncWithSpotify(spotifyApi);
-            // Spotify sometimes returns an empty queue briefly after a fresh token; retry once if we're playing but saw nothing queued.
-            if (this.currentTrack && this.queue.length === 0) {
-                await new Promise((r) => setTimeout(r, 750));
-                await this.syncWithSpotify(spotifyApi);
+            // Get current playback to set the current track
+            const currentPlayback = await spotifyApi.getMyCurrentPlayingTrack();
+            if (currentPlayback.body && currentPlayback.body.item) {
+                const currentUri = currentPlayback.body.item.uri;
+
+                // Fetch metadata for current track (get oldest entry for duplicates)
+                const db = require('./database');
+                const currentMetadata = await new Promise((resolve, reject) => {
+                    db.get(
+                        'SELECT * FROM queue_metadata WHERE track_uri = ? ORDER BY added_at ASC LIMIT 1',
+                        [currentUri],
+                        (err, row) => {
+                            if (err) reject(err);
+                            else resolve(row);
+                        }
+                    );
+                });
+
+                this.currentTrack = {
+                    name: currentPlayback.body.item.name,
+                    artist: currentPlayback.body.item.artists.map(a => a.name).join(', '),
+                    uri: currentPlayback.body.item.uri,
+                    duration: currentPlayback.body.item.duration_ms,
+                    image: currentPlayback.body.item.album.images[0]?.url,
+                    addedBy: currentMetadata ? (currentMetadata.is_anon ? 'Anonymous' : currentMetadata.added_by) : 'Spotify',
+                    displayName: currentMetadata ? (currentMetadata.is_anon ? 'Anonymous' : currentMetadata.display_name) : 'Spotify',
+                    addedAt: currentMetadata ? currentMetadata.added_at : Date.now(),
+                    isAnon: currentMetadata ? currentMetadata.is_anon : 0,
+                    skipShields: currentMetadata ? currentMetadata.skip_shields : 0
+                };
+                this.isPlaying = currentPlayback.body.is_playing;
+                this.progress = currentPlayback.body.progress_ms;
+                //console.log('Current track set:', this.currentTrack.name);
             }
 
-            console.log('[queue-init] Queue length:', this.queue.length);
+            // Try to get the user's queue using REST API (library methods don't work)
+            try {
+                console.log('Fetching queue via REST API...');
+                const queueResponse = await fetch('https://api.spotify.com/v1/me/player/queue', {
+                    headers: { 'Authorization': `Bearer ${spotifyApi.getAccessToken()}` }
+                });
+
+                console.log('Queue API response status:', queueResponse.status);
+
+                if (queueResponse.status === 200) {
+                    const queueData = await queueResponse.json();
+                    console.log('Queue data received, has queue?', !!queueData.queue);
+                    console.log('Queue length:', queueData.queue?.length);
+
+                    if (queueData.queue && Array.isArray(queueData.queue)) {
+                        console.log('Found', queueData.queue.length, 'tracks in Spotify queue');
+
+                        // 📖 Fetch metadata for all tracks from database
+                        const trackUris = queueData.queue.map(item => item.uri);
+                        const metadataMap = await this.getQueueMetadata(trackUris);
+                        console.log('Metadata found for', Object.keys(metadataMap).length, 'tracks');
+
+                        // 🆕 Create default metadata for tracks that don't have it
+                        const db = require('./database');
+                        
+                        // Count how many times each URI appears in the queue
+                        const uriCounts = {};
+                        for (const item of queueData.queue) {
+                            uriCounts[item.uri] = (uriCounts[item.uri] || 0) + 1;
+                        }
+                        
+                        for (const item of queueData.queue) {
+                            const metadataArray = metadataMap[item.uri] || [];
+                            const queueCount = uriCounts[item.uri];
+                            
+                            // If we have fewer metadata entries than queue entries for this URI, create default ones
+                            if (metadataArray.length < queueCount) {
+                                const missingCount = queueCount - metadataArray.length;
+                                console.log(`Creating ${missingCount} default metadata entries for: ${item.name} (URI: ${item.uri})`);
+                                
+                                for (let i = 0; i < missingCount; i++) {
+                                    await new Promise((resolve, reject) => {
+                                        const addedAt = Date.now() + i; // Ensure unique timestamps
+                                        db.run(
+                                            `INSERT INTO queue_metadata (track_uri, added_by, added_at, display_name, is_anon, skip_shields) 
+                                             VALUES (?, ?, ?, ?, ?, ?)`,
+                                            [item.uri, 'Spotify', addedAt, 'Spotify', 0, 0],
+                                            function (err) {
+                                                if (err) {
+                                                    console.error('Failed to create default metadata:', err);
+                                                    reject(err);
+                                                } else {
+                                                    console.log(`Created default metadata (changes: ${this.changes}, lastID: ${this.lastID})`);
+                                                    // Add to metadataMap array
+                                                    if (!metadataMap[item.uri]) {
+                                                        metadataMap[item.uri] = [];
+                                                    }
+                                                    metadataMap[item.uri].push({
+                                                        added_by: 'Spotify',
+                                                        display_name: 'Spotify',
+                                                        added_at: addedAt,
+                                                        is_anon: 0,
+                                                        skip_shields: 0
+                                                    });
+                                                    resolve();
+                                                }
+                                            }
+                                        );
+                                    });
+                                }
+                                // Only create metadata once per URI
+                                uriCounts[item.uri] = metadataArray.length + missingCount;
+                            }
+                        }
+
+                        // Track which metadata entries we've used
+                        const usedMetadataKeys = new Set();
+
+                        // Convert Spotify queue items to our format, merging with metadata
+                        // Use added_at from metadata for proper ordering of duplicate tracks
+                        this.queue = queueData.queue.map(item => {
+                            const metadataArray = metadataMap[item.uri] || [];
+                            let metadata = null;
+                            
+                            // Find the first unused metadata entry for this track
+                            for (const entry of metadataArray) {
+                                const key = `${item.uri}_${entry.added_at}`;
+                                if (!usedMetadataKeys.has(key)) {
+                                    metadata = entry;
+                                    usedMetadataKeys.add(key);
+                                    break;
+                                }
+                            }
+                            
+                            // Fallback to first entry if all are used
+                            if (!metadata && metadataArray.length > 0) {
+                                metadata = metadataArray[0];
+                            }
+
+                            return {
+                                name: item.name,
+                                artist: item.artists.map(a => a.name).join(', '),
+                                uri: item.uri,
+                                duration: item.duration_ms,
+                                image: item.album.images[0]?.url,
+                                addedBy: metadata ? (metadata.is_anon ? 'Anonymous' : metadata.added_by) : 'Spotify',
+                                displayName: metadata ? (metadata.is_anon ? 'Anonymous' : metadata.display_name) : 'Spotify',
+                                addedAt: metadata ? metadata.added_at : Date.now(),
+                                isAnon: metadata ? metadata.is_anon : 0,
+                                skipShields: metadata ? metadata.skip_shields : 0
+                            };
+                        });
+
+                        // Sort the queue by addedAt so earliest additions appear first
+                        this.queue.sort((a, b) => a.addedAt - b.addedAt);
+
+                        console.log('Initialized queue with', this.queue.length, 'tracks');
+                    } else {
+                        console.log('No queue array found in response');
+                        this.queue = [];
+                    }
+                } else {
+                    console.log('Queue API returned status:', queueResponse.status);
+                    this.queue = [];
+                }
+            } catch (queueError) {
+                console.log('Could not fetch Spotify queue:', queueError.message);
+                console.log('Starting with empty queue - tracks will be added as they are queued');
+                this.queue = [];
+            }
+
             this.lastUpdate = Date.now();
+
         } catch (error) {
             console.error('Failed to initialize queue from Spotify:', error);
+            // Don't throw - just continue with empty queue
             this.queue = [];
         }
 
+        // Clients may connect before startup fetch finishes; push final state when ready
         this.broadcastUpdate('queueUpdate', this.getCurrentState());
     }
 
@@ -336,22 +475,18 @@ class QueueManager {
             let currentTrack = null;
             if (currentlyPlayingResponse.status === 200) {
                 const currentData = await currentlyPlayingResponse.json();
-                if (typeof currentData?.is_playing === 'boolean') {
-                    this.isPlaying = currentData.is_playing;
-                }
                 if (currentData && currentData.item) {
-                    const item = currentData.item;
                     currentTrack = {
-                        id: item.id,
-                        name: item.name,
-                        artist: artistStringFromMedia(item),
-                        uri: item.uri,
-                        image: imageUrlFromMedia(item),
+                        id: currentData.item.id,
+                        name: currentData.item.name,
+                        artist: currentData.item.artists.map(a => a.name).join(', '),
+                        uri: currentData.item.uri,
+                        image: currentData.item.album.images?.[0]?.url || null,
                         album: {
-                            name: item.album?.name ?? item.show?.name ?? ''
+                            name: currentData.item.album.name
                         },
-                        duration_ms: item.duration_ms ?? 0,
-                        progress_ms: currentData.progress_ms ?? 0
+                        duration_ms: currentData.item.duration_ms,
+                        progress_ms: currentData.progress_ms
                     };
                     // Note: displayTrack is now called from jukepix.js when a new track is detected
                     // This prevents duplicate requests for the same track
@@ -451,12 +586,11 @@ class QueueManager {
                 return {
                     uri: track.uri,
                     name: track.name,
-                    artist: artistStringFromMedia(track),
+                    artist: track.artists.map(a => a.name).join(', '),
                     addedBy: metadata?.is_anon ? 'Anonymous' : (metadata?.added_by || 'Spotify'),
                     displayName: metadata?.is_anon ? 'Anonymous' : (metadata?.display_name || 'Spotify'),
                     addedAt: metadata?.added_at || fallbackAddedAt,
-                    image: imageUrlFromMedia(track),
-                    duration: track.duration_ms ?? 0,
+                    image: track.album?.images?.[0]?.url,
                     isAnon: metadata?.is_anon || 0,
                     skipShields: metadata?.skip_shields || 0
                 };
