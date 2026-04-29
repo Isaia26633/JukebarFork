@@ -255,12 +255,26 @@ app.get('/diagnostics', isAuthenticated, playbackRateLimit(READ), async (req, re
 
         try {
             const deviceResult = await executePlaybackRead(req, 'diagnostics-playbackModifyCheck', () => spotifyApi.getMyDevices());
-            const hasDevice = (deviceResult.body?.devices?.length || 0) > 0;
+            const devices = deviceResult.body?.devices || [];
+            const activeDevice = devices.find((d) => d.is_active);
+            let pmStatus = 'warning';
+            let pmMessage = 'No devices returned by Spotify';
+            if (devices.length > 0) {
+                if (activeDevice) {
+                    pmStatus = 'pass';
+                    pmMessage = `Active device: ${activeDevice.name}`;
+                } else {
+                    pmStatus = 'warning';
+                    pmMessage =
+                        `${devices.length} device(s) listed; none marked active — start playback or pick a device in Spotify`;
+                }
+            }
             report.tests.playbackModify = {
-                status: hasDevice ? 'pass' : 'warning',
-                message: hasDevice ? 'Playback modify scope available' : 'No active devices found',
-                activeDevices: deviceResult.body?.devices?.length || 0,
-                deviceNames: deviceResult.body?.devices?.map(d => d.name) || []
+                status: pmStatus,
+                message: pmMessage,
+                devicesListed: devices.length,
+                activeDeviceName: activeDevice?.name || null,
+                deviceNames: devices.map((d) => d.name)
             };
         } catch (error) {
             if (Number(error?.statusCode) === 429) enableBrokey('Diagnostics /playbackModify returned 429');
@@ -269,6 +283,40 @@ app.get('/diagnostics', isAuthenticated, playbackRateLimit(READ), async (req, re
                 message: error.message || 'Failed to check playback modify scope',
                 statusCode: error.statusCode,
                 errorBody: error.body?.error || null
+            };
+        }
+
+        try {
+            const queueRes = await fetch('https://api.spotify.com/v1/me/player/queue', {
+                headers: { Authorization: `Bearer ${spotifyApi.getAccessToken()}` }
+            });
+            let upcomingTracks = null;
+            if (queueRes.status === 200) {
+                const queueBody = await queueRes.json();
+                upcomingTracks = Array.isArray(queueBody.queue) ? queueBody.queue.length : null;
+            }
+            let qrStatus = 'pass';
+            let qrMessage = '';
+            if (queueRes.status === 200) {
+                qrMessage = `Queue endpoint OK (${upcomingTracks ?? 0} upcoming track(s))`;
+            } else if (queueRes.status === 429) {
+                qrStatus = 'fail';
+                qrMessage = 'Queue endpoint rate limited (429)';
+                enableBrokey('Diagnostics /queueRead returned 429');
+            } else {
+                qrStatus = 'warning';
+                qrMessage = `Queue endpoint returned HTTP ${queueRes.status}`;
+            }
+            report.tests.queueRead = {
+                status: qrStatus,
+                message: qrMessage,
+                httpStatus: queueRes.status,
+                upcomingTracks
+            };
+        } catch (error) {
+            report.tests.queueRead = {
+                status: 'fail',
+                message: error.message || 'Failed to read playback queue'
             };
         }
 
