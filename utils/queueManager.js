@@ -230,10 +230,14 @@ class QueueManager {
     // Add WebSocket client
     addClient(ws) {
         this.clients.add(ws);
-        // Send current state to new client (same shape as requestQueueUpdate / periodic sync)
+        // Send current state to new client
         if (ws.emit && typeof ws.emit === 'function') {
             // Socket.IO client
-            ws.emit('queueUpdate', this.getCurrentState());
+            ws.emit('queueUpdate', {
+                type: 'initialState',
+                data: this.getCurrentState(),
+                timestamp: Date.now()
+            });
         } else if (ws.readyState === 1) {
             // Raw WebSocket client
             ws.send(JSON.stringify({
@@ -432,9 +436,6 @@ class QueueManager {
             // Don't throw - just continue with empty queue
             this.queue = [];
         }
-
-        // Clients may connect before startup fetch finishes; push final state when ready
-        this.broadcastUpdate('queueUpdate', this.getCurrentState());
     }
 
     // Track the previous track URI to detect track changes
