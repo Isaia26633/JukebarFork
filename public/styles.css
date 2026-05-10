@@ -300,12 +300,12 @@ button.primary:hover {
     width: 90%;
 }
 
-#teacherBanReasonModal.payment-modal {
+#managerBanReasonModal.payment-modal {
     background: rgba(0, 0, 0, 0.7);
     backdrop-filter: blur(2px);
 }
 
-#teacherBanReasonModal .payment-content {
+#managerBanReasonModal .payment-content {
     position: absolute;
     top: 50%;
     left: 50%;
@@ -319,7 +319,7 @@ button.primary:hover {
     padding: 20px;
 }
 
-#teacherBanReasonModal .ban-reason-title {
+#managerBanReasonModal .ban-reason-title {
     margin-bottom: 12px;
     color: #ffffff;
     font-size: 1.25rem;
@@ -327,7 +327,7 @@ button.primary:hover {
     text-align: center;
 }
 
-#teacherBanReasonModal #teacherBanReasonInput {
+#managerBanReasonModal #managerBanReasonInput {
     width: 100%;
     padding: 10px 12px;
     border-radius: 10px;
@@ -337,19 +337,19 @@ button.primary:hover {
     font-size: 0.98rem;
 }
 
-#teacherBanReasonModal #teacherBanReasonInput:focus {
+#managerBanReasonModal #managerBanReasonInput:focus {
     border-color: var(--accent);
     box-shadow: 0 0 0 3px rgba(29, 185, 84, 0.18);
 }
 
-#teacherBanReasonModal .ban-reason-actions {
+#managerBanReasonModal .ban-reason-actions {
     display: flex;
     justify-content: flex-end;
     gap: 10px;
     margin-top: 14px;
 }
 
-#teacher-ban-reason-close {
+#manager-ban-reason-close {
     position: absolute;
     top: 10px;
     right: 12px;
@@ -370,7 +370,7 @@ button.primary:hover {
     transition: background 0.2s ease, transform 0.2s ease;
 }
 
-#teacher-ban-reason-close:hover {
+#manager-ban-reason-close:hover {
     background: rgba(255, 255, 255, 0.18);
     transform: scale(1.03);
 }
@@ -418,8 +418,8 @@ h1 {
     overflow: hidden;
 }
 
-/* Teacher Page Layout - Three Column */
-.teacher-page .main-content {
+/* manager Page Layout - Three Column */
+.manager-page .main-content {
     padding: 16px 20px 20px !important;
     max-width: none !important;
     margin: 0 !important;
@@ -429,12 +429,12 @@ h1 {
     gap: 14px;
 }
 
-.teacher-page .user-greeting {
+.manager-page .user-greeting {
     padding: 0;
     margin: 0;
 }
 
-.teacher-toolbar {
+.manager-toolbar {
     display: flex;
     align-items: center;
     justify-content: flex-start;
@@ -443,27 +443,27 @@ h1 {
     padding: 0 2px;
 }
 
-.teacher-toolbar .teacher-toolbar-greeting {
+.manager-toolbar .manager-toolbar-greeting {
     margin-left: auto;
 }
 
-.teacher-spotify-bg-toggle {
+.manager-spotify-bg-toggle {
     display: flex;
     align-items: center;
     gap: 10px;
 }
 
-.teacher-spotify-bg-label {
+.manager-spotify-bg-label {
     color: #b3b3b3;
     font-size: 0.9rem;
     white-space: nowrap;
 }
 
-.teacher-spotify-bg-toggle .toggle-switch#spotifyBackgroundSwitch {
+.manager-spotify-bg-toggle .toggle-switch#spotifyBackgroundSwitch {
     flex-shrink: 0;
 }
 
-.container.teacher-layout {
+.container.manager-layout {
     max-width: none !important;
     width: 100% !important;
     height: 100%;
@@ -480,11 +480,11 @@ h1 {
         "users spotify banned";
 }
 
-.container.teacher-layout #spotifyPlayer,
-.container.teacher-layout #queueHistory,
-.container.teacher-layout #playlistColumn,
-.container.teacher-layout #userManagement,
-.container.teacher-layout #bannedSongsPanel {
+.container.manager-layout #spotifyPlayer,
+.container.manager-layout #queueHistory,
+.container.manager-layout #playlistColumn,
+.container.manager-layout #userManagement,
+.container.manager-layout #bannedSongsPanel {
     width: 100%;
     height: 100%;
     min-height: 0;
@@ -492,11 +492,11 @@ h1 {
     box-sizing: border-box;
 }
 
-.container.teacher-layout #queueHistory { grid-area: queue; }
-.container.teacher-layout #playlistColumn { grid-area: middle; }
-.container.teacher-layout #spotifyPlayer { grid-area: spotify; }
-.container.teacher-layout #userManagement { grid-area: users; }
-.container.teacher-layout #bannedSongsPanel { grid-area: banned; }
+.container.manager-layout #queueHistory { grid-area: queue; }
+.container.manager-layout #playlistColumn { grid-area: middle; }
+.container.manager-layout #spotifyPlayer { grid-area: spotify; }
+.container.manager-layout #userManagement { grid-area: users; }
+.container.manager-layout #bannedSongsPanel { grid-area: banned; }
 
 #playlistColumn {
     background: #181818;
@@ -566,11 +566,11 @@ h1 {
     text-overflow: ellipsis;
 }
 
-#playlistColumn .teacher-playlist-item {
+#playlistColumn .manager-playlist-item {
     justify-content: space-between;
 }
 
-#playlistColumn .teacher-playlist-item .playlist-meta {
+#playlistColumn .manager-playlist-item .playlist-meta {
     flex: 1;
 }
 
@@ -1481,6 +1481,19 @@ h1 {
     background: rgba(255, 255, 255, 0.14);
 }
 
+.player-control-btn--secondary {
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+}
+
+.player-control-btn--secondary:not(:disabled):hover {
+    border-color: rgba(29, 185, 84, 0.6);
+    background: rgba(255, 255, 255, 0.14);
+}
+
 .player-control-icon {
     width: 16px;
     height: 16px;
@@ -1490,6 +1503,13 @@ h1 {
 .player-control-icon--skip {
     width: 22px;
     height: 22px;
+    filter: invert(1);
+}
+
+.player-control-icon--play-pause {
+    width: 22px;
+    height: 22px;
+    object-fit: contain;
     filter: invert(1);
 }
 
@@ -1671,8 +1691,8 @@ h1 {
     max-width: 1400px;
 }
 
-/* Override for teacher layout */
-.teacher-layout #queueHistory {
+/* Override for manager layout */
+.manager-layout #queueHistory {
     height: 100%;
     max-width: none;
     margin: 0;
@@ -2462,7 +2482,7 @@ p {
     color: #ffcccc !important;
 }
 
-/* teacher */
+/* manager */
 
 #comingSoon {
     font-family: 'miners', sans-serif;
@@ -2549,7 +2569,7 @@ p {
     }
 }
 
-/* Teacher Panel Styles */
+/* manager Panel Styles */
 #userManagement {
     background: #181818;
     border-radius: 20px;
@@ -2565,23 +2585,23 @@ p {
     min-width: 350px;
 }
 
-/* Override for teacher layout to match others */
-.teacher-layout #userManagement,
-.teacher-layout #spotifyPlayer,
-.teacher-layout #queueHistory,
-.teacher-layout #playlistColumn {
+/* Override for manager layout to match others */
+.manager-layout #userManagement,
+.manager-layout #spotifyPlayer,
+.manager-layout #queueHistory,
+.manager-layout #playlistColumn {
     flex: 1 1 0 !important;
     width: auto !important;
     max-width: none !important;
 }
 
-.teacher-layout #bannedSongsPanel {
+.manager-layout #bannedSongsPanel {
     width: auto !important;
     max-width: none !important;
 }
 
 @media (max-width: 1180px) {
-    .container.teacher-layout {
+    .container.manager-layout {
         grid-template-columns: minmax(0, 1fr);
         grid-template-rows: repeat(5, minmax(320px, 1fr));
         grid-template-areas:
@@ -3778,153 +3798,6 @@ p {
     width: 16px;
     height: 16px;
     cursor: pointer;
-}
-
-/* Ban Vote Modal */
-.ban-vote-modal {
-    position: fixed;
-    bottom: 20px;
-    right: 20px;
-    background: var(--inbetween1);
-    border: 2px solid var(--accent);
-    border-radius: 12px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-    z-index: 10000;
-    min-width: 320px;
-    max-width: 400px;
-    overflow: hidden;
-    transition: all 0.3s ease;
-}
-
-.ban-vote-modal.minimized .ban-vote-content {
-    display: none;
-}
-
-.ban-vote-modal.minimized {
-    min-width: 250px;
-}
-
-.ban-vote-header {
-    background: var(--accent);
-    color: var(--text);
-    padding: 12px 48px 12px 16px;
-    display: flex;
-    align-items: center;
-    justify-content: flex-start;
-    font-weight: 600;
-    font-size: 14px;
-    position: relative;
-}
-
-.ban-vote-minimize-btn,
-.ban-vote-close-btn {
-    background: none;
-    border: none;
-    color: var(--text);
-    font-size: 20px;
-    font-weight: bold;
-    cursor: pointer;
-    padding: 0;
-    width: 24px;
-    height: 24px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: 4px;
-    transition: background 0.2s;
-    position: absolute;
-    right: 12px;
-}
-
-.ban-vote-minimize-btn:hover,
-.ban-vote-close-btn:hover {
-    background: rgba(255, 255, 255, 0.2);
-}
-
-.ban-vote-content {
-    padding: 16px;
-}
-
-.ban-vote-content h3 {
-    color: var(--text);
-    font-size: 16px;
-    margin-bottom: 16px;
-    line-height: 1.4;
-}
-
-.ban-vote-details {
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-}
-
-.vote-counts {
-    display: flex;
-    justify-content: space-around;
-    padding: 12px;
-    background: var(--background);
-    border-radius: 8px;
-}
-
-.vote-counts span {
-    color: var(--inbetween3);
-    font-size: 14px;
-}
-
-.vote-counts strong {
-    color: var(--text);
-    font-size: 18px;
-    margin-left: 4px;
-}
-
-.vote-buttons {
-    display: flex;
-    gap: 12px;
-}
-
-.vote-yes-btn,
-.vote-no-btn {
-    flex: 1;
-    padding: 10px 16px;
-    border: none;
-    border-radius: 8px;
-    font-weight: 600;
-    font-size: 14px;
-    cursor: pointer;
-    transition: all 0.2s;
-}
-
-.vote-yes-btn {
-    background: var(--accent);
-    color: var(--text);
-}
-
-.vote-yes-btn:hover:not(:disabled) {
-    background: var(--accent-dark);
-    transform: translateY(-2px);
-}
-
-.vote-no-btn {
-    background: #f44336;
-    color: var(--text);
-}
-
-.vote-no-btn:hover:not(:disabled) {
-    background: #d32f2f;
-    transform: translateY(-2px);
-}
-
-.vote-yes-btn:disabled,
-.vote-no-btn:disabled {
-    cursor: not-allowed;
-    opacity: 0.5;
-}
-
-.vote-timer {
-    text-align: center;
-    color: var(--inbetween3);
-    font-size: 14px;
-    font-weight: 600;
 }
 
 .jukepix-toggle,

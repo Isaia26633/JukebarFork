@@ -31,7 +31,7 @@ Jukebar is a Node.js classroom jukebox that integrates with Spotify and Formbar.
 
 - Node.js 18+
 - Spotify Premium account and Spotify app credentials (Development Mode or Extended Quota Mode)
-- Formbar instance access and API key
+- Optional Formbar instance access and API key (Jukebar can now run without Formbar if `FORMBAR_ADDRESS` is left blank)
 - Active Spotify playback device
 - Optional: `omxplayer` (Raspberry Pi — plays blocked-skip SFX)
 
@@ -144,7 +144,8 @@ All values are environment-driven and can be changed in `.env`.
 
 ### Auth
 
-- `GET /login`
+- `GET /login` — opens the login page. If Formbar is configured, you can use Formbar OAuth or a local login fallback.
+- `POST /login/local` — submit local login credentials when not using Formbar.
 - `GET /logout`
 
 ### Spotify and Queue

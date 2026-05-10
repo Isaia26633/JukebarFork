@@ -15,22 +15,6 @@
             <a href="/" id="jubnbark">Jukebar</a>
         </div>
         <ul class="nav-links">
-            <% 
-                const permVal = Number(typeof userPermission !== 'undefined' ? userPermission : (user && user.permission));
-                const uid = Number(typeof userID !== 'undefined' ? userID : (user && user.id ? user.id : 0));
-                const ownerArr = typeof ownerIDs !== 'undefined' ? ownerIDs : [];
-                const isOwnerUser = ownerArr.includes(uid);
-            %>
-            <li>
-                <% if (permVal >= 4 || isOwnerUser) { %>
-                    <a href="/teacher" class="<%= typeof page !== 'undefined' && page === 'teacher' ? 'active' : '' %>">Teacher</a>
-                <% } %>
-            </li>
-            <li><a href="/" class="<%= typeof page !== 'undefined' && page === 'player' ? 'active' : '' %>">Player</a>
-            </li>
-            <li><a href="/leaderboard"
-                    class="<%= typeof page !== 'undefined' && page === 'leaderboard' ? 'active' : '' %>">Leaderboard</a>
-            </li>
             <li class="logout-link"><a href="/logout"
                     class="<%= typeof page !== 'undefined' && page === 'logout' ? 'active' : '' %>"
                     onclick="if(!confirm('Do you want to log out?')) return false;">Logout</a></li>

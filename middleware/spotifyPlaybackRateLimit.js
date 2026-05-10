@@ -25,7 +25,7 @@ function nowMs() {
 }
 
 function getRequesterKey(req) {
-    const userId = req.session?.token?.id;
+    const userId = req.session?.userId;
     if (userId !== null && userId !== undefined) {
         return `user:${userId}`;
     }

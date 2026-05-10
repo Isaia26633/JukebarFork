@@ -1,33 +1,17 @@
 const express = require('express');
 const router = express.Router();
 const { isAuthenticated } = require('../middleware/auth');
-const { isOwner } = require('../utils/owners');
 
-// Middleware to check if user has teacher permissions
-const requireTeacherAccess = (req, res, next) => {
-    if (req.session.permission >= 4 || isOwner(req.session.token?.id)) {
-        next();
-    } else {
-        return res.status(403).json({ error: 'Insufficient permissions' });
-    }
-};
-
-// Get all users (for teacher panel)
-router.get('/api/users', isAuthenticated, requireTeacherAccess, async (req, res) => {
+// Get all users
+router.get('/api/users', isAuthenticated, async (req, res) => {
     try {
         const db = require('../utils/database');
-        
-        // Get all users from database
         const users = await new Promise((resolve, reject) => {
-            db.all("SELECT id, displayName, COALESCE(isBanned, 0) as isBanned, COALESCE(permission, 2) as permission FROM users ORDER BY displayName COLLATE NOCASE", (err, rows) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(rows || []);
-                }
+            db.all("SELECT id, display_name as displayName, COALESCE(is_banned, 0) as isBanned, COALESCE(is_manager, 0) as is_manager FROM users ORDER BY display_name COLLATE NOCASE", (err, rows) => {
+                if (err) reject(err);
+                else resolve(rows || []);
             });
         });
-        
         res.json(users);
     } catch (error) {
         console.error('Error fetching users:', error);
@@ -36,19 +20,16 @@ router.get('/api/users', isAuthenticated, requireTeacherAccess, async (req, res)
 });
 
 // Get queue history (play transactions only)
-router.get('/api/queueHistory', isAuthenticated, requireTeacherAccess, async (req, res) => {
-    console.log('Queue history endpoint hit - User:', req.session.user, 'Permission:', req.session.permission);
+router.get('/api/queueHistory', isAuthenticated, async (req, res) => {
+    console.log('Queue history endpoint hit - User:', req.session.user);
     try {
         const db = require('../utils/database');
         const limit = parseInt(req.query.limit) || 20;
         const offset = parseInt(req.query.offset) || 0;
-        
-        console.log('Fetching queue history - limit:', limit, 'offset:', offset);
-        
-        // Get play transactions with user info
+
         const plays = await new Promise((resolve, reject) => {
             db.all(`
-                SELECT 
+                SELECT
                     t.track_name,
                     t.artist_name,
                     t.track_uri,
@@ -61,11 +42,8 @@ router.get('/api/queueHistory', isAuthenticated, requireTeacherAccess, async (re
                 ORDER BY t.timestamp DESC
                 LIMIT ? OFFSET ?
             `, [limit, offset], (err, rows) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(rows || []);
-                }
+                if (err) reject(err);
+                else resolve(rows || []);
             });
         });
 
@@ -81,11 +59,10 @@ router.get('/api/queueHistory', isAuthenticated, requireTeacherAccess, async (re
     }
 });
 
-// Get banned songs list (for teacher panel)
-router.get('/api/banned-songs', isAuthenticated, requireTeacherAccess, async (req, res) => {
+// Get banned songs list
+router.get('/api/banned-songs', isAuthenticated, async (req, res) => {
     try {
         const db = require('../utils/database');
-        const normalizedKey = (trackName, artistName) => `${String(trackName || '').trim().toLowerCase()}||${String(artistName || '').trim().toLowerCase()}`;
         const songs = await new Promise((resolve, reject) => {
             db.all(`
                 SELECT
@@ -96,7 +73,7 @@ router.get('/api/banned-songs', isAuthenticated, requireTeacherAccess, async (re
                     b.reason,
                     b.banned_by,
                     b.timestamp,
-                    u.displayName AS banned_by_name,
+                    u.display_name AS banned_by_name,
                     COALESCE(
                         NULLIF(b.image_url, ''),
                         (SELECT t.image_url FROM transactions t
@@ -139,18 +116,17 @@ router.get('/api/banned-songs', isAuthenticated, requireTeacherAccess, async (re
 });
 
 // Ban a user
-router.post('/api/users/ban', isAuthenticated, requireTeacherAccess, async (req, res) => {
+router.post('/api/users/ban', isAuthenticated, async (req, res) => {
     try {
         const { username } = req.body;
         const db = require('../utils/database');
-        
+
         if (!username) {
             return res.status(400).json({ error: 'Username is required' });
         }
 
-        // Check if target user is a teacher or owner — cannot ban them
         const targetUser = await new Promise((resolve, reject) => {
-            db.get("SELECT id, COALESCE(permission, 2) as permission FROM users WHERE displayName = ?", [username], (err, row) => {
+            db.get("SELECT id FROM users WHERE display_name = ?", [username], (err, row) => {
                 if (err) reject(err);
                 else resolve(row);
             });
@@ -160,26 +136,16 @@ router.post('/api/users/ban', isAuthenticated, requireTeacherAccess, async (req,
             return res.status(404).json({ error: 'User not found' });
         }
 
-        if (targetUser.permission >= 4 || isOwner(targetUser.id)) {
-            return res.status(403).json({ error: 'Cannot ban a teacher or owner' });
-        }
-
-        // Update user's banned status in database
         await new Promise((resolve, reject) => {
-            db.run("UPDATE users SET isBanned = 1 WHERE displayName = ?", [username], function(err) {
-                if (err) {
-                    reject(err);
-                } else if (this.changes === 0) {
-                    reject(new Error('User not found'));
-                } else {
-                    resolve();
-                }
+            db.run("UPDATE users SET is_banned = 1 WHERE display_name = ?", [username], function (err) {
+                if (err) reject(err);
+                else if (this.changes === 0) reject(new Error('User not found'));
+                else resolve();
             });
         });
-        
+
         console.log(`Banning user: ${username}`);
 
-        // Emit real-time ban event to all clients
         const io = req.app.get('io');
         if (io) {
             io.emit('userBanned', { userId: targetUser.id, username });
@@ -193,36 +159,29 @@ router.post('/api/users/ban', isAuthenticated, requireTeacherAccess, async (req,
 });
 
 // Unban a user
-router.post('/api/users/unban', isAuthenticated, requireTeacherAccess, async (req, res) => {
+router.post('/api/users/unban', isAuthenticated, async (req, res) => {
     try {
         const { username } = req.body;
         const db = require('../utils/database');
-        
+
         if (!username) {
             return res.status(400).json({ error: 'Username is required' });
         }
 
-        // Update user's banned status in database
         await new Promise((resolve, reject) => {
-            db.run("UPDATE users SET isBanned = 0 WHERE displayName = ?", [username], function(err) {
-                if (err) {
-                    reject(err);
-                } else if (this.changes === 0) {
-                    reject(new Error('User not found'));
-                } else {
-                    resolve();
-                }
+            db.run("UPDATE users SET is_banned = 0 WHERE display_name = ?", [username], function (err) {
+                if (err) reject(err);
+                else if (this.changes === 0) reject(new Error('User not found'));
+                else resolve();
             });
         });
-        
+
         console.log(`Unbanning user: ${username}`);
 
-        // Emit real-time unban event to all clients
         const io = req.app.get('io');
         if (io) {
-            // Look up the user's ID for targeted unban
             const unbannedUser = await new Promise((resolve, reject) => {
-                db.get("SELECT id FROM users WHERE displayName = ?", [username], (err, row) => {
+                db.get("SELECT id FROM users WHERE display_name = ?", [username], (err, row) => {
                     if (err) reject(err);
                     else resolve(row);
                 });
@@ -239,12 +198,12 @@ router.post('/api/users/unban', isAuthenticated, requireTeacherAccess, async (re
     }
 });
 
-// Get list of banned users (for teacher panel)
-router.get('/api/users/banned', isAuthenticated, requireTeacherAccess, async (req, res) => {
+// Get list of banned users (for manager panel)
+router.get('/api/users/banned', isAuthenticated, async (req, res) => {
     try {
         const db = require('../utils/database');
         const users = await new Promise((resolve, reject) => {
-            db.all("SELECT id, displayName FROM users WHERE isBanned = 1 ORDER BY displayName COLLATE NOCASE", (err, rows) => {
+            db.all("SELECT id, display_name as displayName FROM users WHERE is_banned = 1 ORDER BY display_name COLLATE NOCASE", (err, rows) => {
                 if (err) reject(err);
                 else resolve(rows || []);
             });
@@ -256,20 +215,20 @@ router.get('/api/users/banned', isAuthenticated, requireTeacherAccess, async (re
     }
 });
 
-// Check if the current user is banned (student self-check)
+// Check if the current user is banned (self-check)
 router.get('/api/me/banned', isAuthenticated, async (req, res) => {
     try {
         const db = require('../utils/database');
-        const userId = req.session.token?.id;
+        const userId = req.session.userId;
         if (!userId) return res.json({ banned: false });
 
         const user = await new Promise((resolve, reject) => {
-            db.get("SELECT COALESCE(isBanned, 0) as isBanned FROM users WHERE id = ?", [userId], (err, row) => {
+            db.get("SELECT COALESCE(is_banned, 0) as is_banned FROM users WHERE id = ?", [userId], (err, row) => {
                 if (err) reject(err);
                 else resolve(row);
             });
         });
-        res.json({ banned: !!(user && user.isBanned) });
+        res.json({ banned: !!(user && user.is_banned) });
     } catch (error) {
         console.error('Error checking ban status:', error);
         res.json({ banned: false });
@@ -277,11 +236,11 @@ router.get('/api/me/banned', isAuthenticated, async (req, res) => {
 });
 
 // Get user transactions
-router.post('/api/users/transactions', isAuthenticated, requireTeacherAccess, async (req, res) => {
+router.post('/api/users/transactions', isAuthenticated, async (req, res) => {
     try {
         const { username, page = 1, limit = 10 } = req.body;
         const db = require('../utils/database');
-        
+
         if (!username) {
             return res.status(400).json({ error: 'Username is required' });
         }
@@ -290,14 +249,10 @@ router.post('/api/users/transactions', isAuthenticated, requireTeacherAccess, as
         const limitNum = parseInt(limit);
         const offset = (pageNum - 1) * limitNum;
 
-        // First, get the user ID from the username
         const user = await new Promise((resolve, reject) => {
-            db.get("SELECT id FROM users WHERE displayName = ?", [username], (err, row) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(row);
-                }
+            db.get("SELECT id FROM users WHERE display_name = ?", [username], (err, row) => {
+                if (err) reject(err);
+                else resolve(row);
             });
         });
 
@@ -305,21 +260,16 @@ router.post('/api/users/transactions', isAuthenticated, requireTeacherAccess, as
             return res.status(404).json({ error: 'User not found' });
         }
 
-        // Get total count of play transactions for this user
         const totalCount = await new Promise((resolve, reject) => {
             db.get("SELECT COUNT(*) as count FROM transactions WHERE user_id = ? AND action = 'play'", [user.id], (err, row) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(row.count);
-                }
+                if (err) reject(err);
+                else resolve(row.count);
             });
         });
 
-        // Get paginated play transactions for this user
         const transactions = await new Promise((resolve, reject) => {
             db.all(`
-                SELECT 
+                SELECT
                     track_name,
                     artist_name,
                     action,
@@ -327,33 +277,28 @@ router.post('/api/users/transactions', isAuthenticated, requireTeacherAccess, as
                     image_url,
                     timestamp,
                     datetime(timestamp) as formatted_time
-                FROM transactions 
+                FROM transactions
                 WHERE user_id = ? AND action = 'play'
-                ORDER BY timestamp DESC 
+                ORDER BY timestamp DESC
                 LIMIT ? OFFSET ?
             `, [user.id, limitNum, offset], (err, rows) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(rows || []);
-                }
+                if (err) reject(err);
+                else resolve(rows || []);
             });
         });
 
         const totalPages = Math.ceil(totalCount / limitNum);
-        const hasNextPage = pageNum < totalPages;
-        const hasPrevPage = pageNum > 1;
 
-        res.json({ 
-            success: true, 
+        res.json({
+            success: true,
             username: username,
             transactions: transactions,
             pagination: {
                 currentPage: pageNum,
                 totalPages: totalPages,
                 totalCount: totalCount,
-                hasNextPage: hasNextPage,
-                hasPrevPage: hasPrevPage,
+                hasNextPage: pageNum < totalPages,
+                hasPrevPage: pageNum > 1,
                 limit: limitNum
             }
         });
@@ -364,11 +309,11 @@ router.post('/api/users/transactions', isAuthenticated, requireTeacherAccess, as
 });
 
 // Get transaction modal partial
-router.post('/api/users/transactions/modal', isAuthenticated, requireTeacherAccess, async (req, res) => {
+router.post('/api/users/transactions/modal', isAuthenticated, async (req, res) => {
     try {
         const { username, page = 1, limit = 10 } = req.body;
         const db = require('../utils/database');
-        
+
         if (!username) {
             return res.status(400).json({ error: 'Username is required' });
         }
@@ -377,14 +322,10 @@ router.post('/api/users/transactions/modal', isAuthenticated, requireTeacherAcce
         const limitNum = parseInt(limit);
         const offset = (pageNum - 1) * limitNum;
 
-        // First, get the user ID from the username
         const user = await new Promise((resolve, reject) => {
-            db.get("SELECT id FROM users WHERE displayName = ?", [username], (err, row) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(row);
-                }
+            db.get("SELECT id FROM users WHERE display_name = ?", [username], (err, row) => {
+                if (err) reject(err);
+                else resolve(row);
             });
         });
 
@@ -392,21 +333,16 @@ router.post('/api/users/transactions/modal', isAuthenticated, requireTeacherAcce
             return res.status(404).json({ error: 'User not found' });
         }
 
-        // Get total count of play transactions for this user
         const totalCount = await new Promise((resolve, reject) => {
             db.get("SELECT COUNT(*) as count FROM transactions WHERE user_id = ? AND action = 'play'", [user.id], (err, row) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(row.count);
-                }
+                if (err) reject(err);
+                else resolve(row.count);
             });
         });
 
-        // Get paginated play transactions for this user
         const transactions = await new Promise((resolve, reject) => {
             db.all(`
-                SELECT 
+                SELECT
                     track_name,
                     artist_name,
                     action,
@@ -414,29 +350,23 @@ router.post('/api/users/transactions/modal', isAuthenticated, requireTeacherAcce
                     image_url,
                     timestamp,
                     datetime(timestamp) as formatted_time
-                FROM transactions 
+                FROM transactions
                 WHERE user_id = ? AND action = 'play'
-                ORDER BY timestamp DESC 
+                ORDER BY timestamp DESC
                 LIMIT ? OFFSET ?
             `, [user.id, limitNum, offset], (err, rows) => {
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(rows || []);
-                }
+                if (err) reject(err);
+                else resolve(rows || []);
             });
         });
 
         const totalPages = Math.ceil(totalCount / limitNum);
-        const hasNextPage = pageNum < totalPages;
-        const hasPrevPage = pageNum > 1;
-
         const pagination = {
             currentPage: pageNum,
             totalPages: totalPages,
             totalCount: totalCount,
-            hasNextPage: hasNextPage,
-            hasPrevPage: hasPrevPage,
+            hasNextPage: pageNum < totalPages,
+            hasPrevPage: pageNum > 1,
             limit: limitNum
         };
 

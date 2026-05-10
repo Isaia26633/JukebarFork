@@ -1,4 +1,3 @@
-const { isJukepixEnabled } = require('./jukepix');
 class QueueManager {
     constructor() {
         this.currentTrack = null;
@@ -230,14 +229,9 @@ class QueueManager {
     // Add WebSocket client
     addClient(ws) {
         this.clients.add(ws);
-        // Send current state to new client
+        // Send current state to new client (same shape as requestQueueUpdate)
         if (ws.emit && typeof ws.emit === 'function') {
-            // Socket.IO client
-            ws.emit('queueUpdate', {
-                type: 'initialState',
-                data: this.getCurrentState(),
-                timestamp: Date.now()
-            });
+            ws.emit('queueUpdate', this.getCurrentState());
         } else if (ws.readyState === 1) {
             // Raw WebSocket client
             ws.send(JSON.stringify({
@@ -290,8 +284,7 @@ class QueueManager {
                     addedBy: currentMetadata ? (currentMetadata.is_anon ? 'Anonymous' : currentMetadata.added_by) : 'Spotify',
                     displayName: currentMetadata ? (currentMetadata.is_anon ? 'Anonymous' : currentMetadata.display_name) : 'Spotify',
                     addedAt: currentMetadata ? currentMetadata.added_at : Date.now(),
-                    isAnon: currentMetadata ? currentMetadata.is_anon : 0,
-                    skipShields: currentMetadata ? currentMetadata.skip_shields : 0
+                    isAnon: currentMetadata ? currentMetadata.is_anon : 0
                 };
                 this.isPlaying = currentPlayback.body.is_playing;
                 this.progress = currentPlayback.body.progress_ms;
@@ -342,9 +335,8 @@ class QueueManager {
                                     await new Promise((resolve, reject) => {
                                         const addedAt = Date.now() + i; // Ensure unique timestamps
                                         db.run(
-                                            `INSERT INTO queue_metadata (track_uri, added_by, added_at, display_name, is_anon, skip_shields) 
-                                             VALUES (?, ?, ?, ?, ?, ?)`,
-                                            [item.uri, 'Spotify', addedAt, 'Spotify', 0, 0],
+                                            `INSERT INTO queue_metadata (track_uri, added_by, added_at, display_name, is_anon) VALUES (?, ?, ?, ?, ?)`,
+                                            [item.uri, 'Spotify', addedAt, 'Spotify', 0],
                                             function (err) {
                                                 if (err) {
                                                     console.error('Failed to create default metadata:', err);
@@ -359,8 +351,7 @@ class QueueManager {
                                                         added_by: 'Spotify',
                                                         display_name: 'Spotify',
                                                         added_at: addedAt,
-                                                        is_anon: 0,
-                                                        skip_shields: 0
+                                                        is_anon: 0
                                                     });
                                                     resolve();
                                                 }
@@ -406,8 +397,7 @@ class QueueManager {
                                 addedBy: metadata ? (metadata.is_anon ? 'Anonymous' : metadata.added_by) : 'Spotify',
                                 displayName: metadata ? (metadata.is_anon ? 'Anonymous' : metadata.display_name) : 'Spotify',
                                 addedAt: metadata ? metadata.added_at : Date.now(),
-                                isAnon: metadata ? metadata.is_anon : 0,
-                                skipShields: metadata ? metadata.skip_shields : 0
+                                isAnon: metadata ? metadata.is_anon : 0
                             };
                         });
 
@@ -474,8 +464,12 @@ class QueueManager {
 
             // Process currently playing
             let currentTrack = null;
-            if (currentlyPlayingResponse.status === 200) {
+            if (currentlyPlayingResponse.status === 204) {
+                this.isPlaying = false;
+                currentTrack = null;
+            } else if (currentlyPlayingResponse.status === 200) {
                 const currentData = await currentlyPlayingResponse.json();
+                this.isPlaying = !!currentData?.is_playing;
                 if (currentData && currentData.item) {
                     currentTrack = {
                         id: currentData.item.id,
@@ -489,8 +483,8 @@ class QueueManager {
                         duration_ms: currentData.item.duration_ms,
                         progress_ms: currentData.progress_ms
                     };
-                    // Note: displayTrack is now called from jukepix.js when a new track is detected
-                    // This prevents duplicate requests for the same track
+                } else {
+                    currentTrack = null;
                 }
             }
 
@@ -541,7 +535,6 @@ class QueueManager {
                     currentTrack.addedBy = metadata.added_by;
                     currentTrack.displayName = metadata.display_name;
                     currentTrack.isAnon = metadata.is_anon;
-                    currentTrack.skipShields = metadata.skip_shields;
                     currentTrack.addedAt = metadata.added_at;
                     
                     // Mark this metadata as used so queue items don't use it
@@ -592,8 +585,7 @@ class QueueManager {
                     displayName: metadata?.is_anon ? 'Anonymous' : (metadata?.display_name || 'Spotify'),
                     addedAt: metadata?.added_at || fallbackAddedAt,
                     image: track.album?.images?.[0]?.url,
-                    isAnon: metadata?.is_anon || 0,
-                    skipShields: metadata?.skip_shields || 0
+                    isAnon: metadata?.is_anon || 0
                 };
             });
 
@@ -606,15 +598,8 @@ class QueueManager {
                 this.progress = currentTrack.progress_ms;
             }
 
-            // Broadcast BOTH at the same time using existing broadcast methods
-            this.broadcastUpdate('queueUpdate', {
-                queue: newQueue,
-                currentTrack: currentTrack,
-                isPlaying: this.isPlaying,
-                progress: this.progress,
-                lastUpdate: Date.now()
-            });
-
+            this.lastUpdate = Date.now();
+            this.broadcastUpdate('queueUpdate', this.getCurrentState());
             this.broadcastUpdate('currentTrack', currentTrack);
 
             return { currentTrack, queue: newQueue };
@@ -648,7 +633,7 @@ class QueueManager {
             }
 
             const placeholders = trackUris.map(() => '?').join(',');
-            const query = `SELECT track_uri, added_by, display_name, added_at, is_anon, skip_shields FROM queue_metadata WHERE track_uri IN (${placeholders}) ORDER BY added_at ASC`;
+            const query = `SELECT track_uri, added_by, display_name, added_at, is_anon FROM queue_metadata WHERE track_uri IN (${placeholders}) ORDER BY added_at ASC`;
 
             db.all(query, trackUris, (err, rows) => {
                 if (err) {
@@ -668,8 +653,7 @@ class QueueManager {
                                 added_by: row.added_by,
                                 display_name: row.display_name,
                                 added_at: row.added_at,
-                                is_anon: row.is_anon,
-                                skip_shields: row.skip_shields
+                                is_anon: row.is_anon
                             });
                         }
                     }

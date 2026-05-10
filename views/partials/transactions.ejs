@@ -17,7 +17,6 @@
                             <th style="width:50px;"></th>
                             <th>Track</th>
                             <th>Artist</th>
-                            <th>Cost</th>
                             <th>Time</th>
                         </tr>
                     </thead>
@@ -33,7 +32,6 @@
                                 </td>
                                 <td><%= transaction.track_name || 'Unknown' %></td>
                                 <td><%= transaction.artist_name || 'Unknown' %></td>
-                                <td><span class="cost-badge"><%= transaction.cost %> Digipogs</span></td>
                                 <td><%= transaction.formatted_time %></td>
                             </tr>
                         <% }); %>

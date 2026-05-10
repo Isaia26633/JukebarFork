@@ -1,47 +1,141 @@
+/**
+ * Jukebar Database Setup Script
+ *
+ * Run this script to (re)create the database from scratch:
+ *   node migrate.js
+ *
+ * WARNING: This drops all existing tables and recreates them. All data will be lost.
+ */
+
 const sqlite3 = require('sqlite3').verbose();
-const db = new sqlite3.Database('db/database.db');
+const fs = require('fs');
+
+const folderPath = 'db';
+if (!fs.existsSync(folderPath)) {
+    fs.mkdirSync(folderPath, { recursive: true });
+}
+
+const db = new sqlite3.Database('db/database.db', (err) => {
+    if (err) {
+        console.error('Failed to open database:', err.message);
+        process.exit(1);
+    }
+    console.log('Connected to db/database.db');
+});
+
+const tables = [
+    'custom_playlists',
+    'allowed_playlists',
+    'track_bans',
+    'currently_playing',
+    'queue_metadata',
+    'banned_songs',
+    'transactions',
+    'users'
+];
 
 db.serialize(() => {
-    db.run(`CREATE TABLE IF NOT EXISTS jukepix_settings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        match_type TEXT NOT NULL CHECK(match_type IN ('artist', 'song')),
-        match_value TEXT NOT NULL,
-        match_artist TEXT,
-        text_color TEXT DEFAULT '#ffffff',
-        progress_fg1 TEXT DEFAULT '#00ff00',
-        progress_fg2 TEXT DEFAULT '#29ff29',
-        skip_sound TEXT,
-        shield_sound TEXT,
-        scroll_speed INTEGER DEFAULT 50,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(match_type, match_value, match_artist)
-    )`, (err) => {
-        if (err) console.error('jukepix_settings:', err.message);
-        else console.log('jukepix_settings OK');
-    });
+    console.log('Dropping existing tables...');
+    for (const table of tables) {
+        db.run(`DROP TABLE IF EXISTS ${table}`, (err) => {
+            if (err) console.error(`Error dropping ${table}:`, err.message);
+            else console.log(`  Dropped: ${table}`);
+        });
+    }
 
-    db.run(`CREATE TABLE IF NOT EXISTS jukepix_defaults (
-        id INTEGER PRIMARY KEY CHECK(id = 1),
-        text_color TEXT DEFAULT '#ffffff',
-        bg_color TEXT DEFAULT '#000000',
-        progress_fg1 TEXT DEFAULT '#00ff00',
-        progress_fg2 TEXT DEFAULT '#29ff29',
-        gradient_start TEXT DEFAULT '#1ed760',
-        gradient_end TEXT DEFAULT '#0c4d22',
-        scroll_speed INTEGER DEFAULT 50,
-        skip_sound TEXT,
-        shield_sound TEXT,
+    console.log('Creating tables...');
+
+    db.run(`CREATE TABLE users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        is_manager INTEGER DEFAULT 0,
+        is_banned INTEGER DEFAULT 0,
+        recently_queued_cleared_at DATETIME
+    )`, logResult('users'));
+
+    db.run(`CREATE TABLE transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        display_name TEXT NOT NULL,
+        action TEXT NOT NULL,
+        track_uri TEXT,
+        track_name TEXT,
+        artist_name TEXT,
+        image_url TEXT,
+        cost INTEGER NOT NULL DEFAULT 0,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )`, logResult('transactions'));
+
+    db.run(`CREATE TABLE banned_songs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        track_name TEXT NOT NULL,
+        artist_name TEXT NOT NULL,
+        track_uri TEXT,
+        image_url TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        banned_by TEXT NOT NULL DEFAULT 'unknown',
+        reason TEXT DEFAULT 'No reason given'
+    )`, logResult('banned_songs'));
+
+    db.run(`CREATE TABLE queue_metadata (
+        track_uri TEXT NOT NULL,
+        added_by TEXT NOT NULL,
+        added_at INTEGER NOT NULL,
+        display_name TEXT NOT NULL,
+        is_anon INTEGER DEFAULT 0
+    )`, logResult('queue_metadata'));
+
+    db.run(`CREATE TABLE currently_playing (
+        track_uri TEXT PRIMARY KEY,
+        added_by TEXT NOT NULL,
+        added_at INTEGER NOT NULL,
+        display_name TEXT NOT NULL,
+        is_anon INTEGER DEFAULT 0,
+        duration_ms INTEGER DEFAULT 0
+    )`, logResult('currently_playing'));
+
+    db.run(`CREATE TABLE track_bans (
+        track_uri TEXT PRIMARY KEY,
+        banned_at INTEGER NOT NULL
+    )`, logResult('track_bans'));
+
+    db.run(`CREATE TABLE allowed_playlists (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        spotify_playlist_id TEXT NOT NULL UNIQUE,
+        name TEXT,
+        owner_name TEXT,
+        image_url TEXT,
+        total_tracks INTEGER DEFAULT 0,
+        is_allowed INTEGER DEFAULT 0,
+        updated_by INTEGER,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`, (err) => {
-        if (err) console.error('jukepix_defaults:', err.message);
-        else console.log('jukepix_defaults OK');
-    });
+    )`, logResult('allowed_playlists'));
 
-    db.run(`INSERT OR IGNORE INTO jukepix_defaults (id) VALUES (1)`, (err) => {
-        if (err) console.error('insert defaults:', err.message);
-        else console.log('default row OK');
-        db.close(() => console.log('Migration complete.'));
+    db.run(`CREATE TABLE custom_playlists (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        spotify_playlist_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        song_count INTEGER DEFAULT 0,
+        image_url TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )`, (err) => {
+        logResult('custom_playlists')(err);
+        db.close((closeErr) => {
+            if (closeErr) console.error('Error closing DB:', closeErr.message);
+            else console.log('\nMigration complete. Database is ready.');
+        });
     });
 });
+
+function logResult(name) {
+    return (err) => {
+        if (err) console.error(`  Error creating ${name}:`, err.message);
+        else console.log(`  Created: ${name}`);
+    };
+}

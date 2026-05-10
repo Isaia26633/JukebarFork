@@ -2,24 +2,11 @@ const express = require('express');
 const router = express.Router();
 const db = require('../utils/database');
 const { spotifyApi, ensureSpotifyAccessToken } = require('../utils/spotify');
-const { isOwner } = require('../utils/owners');
 const { logTransaction } = require('./logging');
 const { isAuthenticated } = require('../middleware/auth');
-const { getCurrentClassId, requestAndWaitForClassId } = require('./socket');
 const queueManager = require('../utils/queueManager');
 const { MODIFY, playbackRateLimit, executePlaybackModify } = require('../middleware/spotifyPlaybackRateLimit');
 
-async function getClassId() {
-    const cached = getCurrentClassId();
-    if (cached !== null && cached !== undefined) return cached;
-    const fetched = await requestAndWaitForClassId();
-    return fetched ?? null;
-}
-
-const CREATE_PLAYLIST_AMOUNT = () => Number(process.env.CREATE_PLAYLIST_AMOUNT) || 700;
-const ADD_PLAYLIST_SONG_AMOUNT = () => Number(process.env.ADD_PLAYLIST_SONG_AMOUNT) || 100;
-const REMOVE_PLAYLIST_SONG_AMOUNT = () => Number(process.env.REMOVE_PLAYLIST_SONG_AMOUNT) || 50;
-const CUSTOM_PLAYLIST_PLAY_AMOUNT = () => Number(process.env.CUSTOM_PLAYLIST_PLAY_AMOUNT) || 250;
 const INITIAL_FREE_SONGS = 5;
 
 function isValidTrackUri(uri) {
@@ -41,14 +28,13 @@ function getBannedSongs() {
 
 function getUserBanned(userId) {
     return new Promise((resolve, reject) => {
-        db.get("SELECT COALESCE(isBanned, 0) as isBanned FROM users WHERE id = ?", [userId], (err, row) => {
+        db.get("SELECT COALESCE(is_banned, 0) as is_banned FROM users WHERE id = ?", [userId], (err, row) => {
             if (err) return reject(err);
-            resolve(row && row.isBanned === 1);
+            resolve(row && row.is_banned === 1);
         });
     });
 }
 
-// Validate that track URIs are real, non-explicit, and not banned
 async function validateTrackUris(uris) {
     if (!Array.isArray(uris) || uris.length === 0) return { valid: true };
 
@@ -59,9 +45,6 @@ async function validateTrackUris(uris) {
     }
 
     await ensureSpotifyAccessToken();
-    // Batch GET /tracks was removed for Dev Mode apps in Feb 2026; fetch individually in parallel.
-    // If Spotify returns 403/429 (Dev Mode restriction or rate limit), allow the track through —
-    // it was already confirmed to exist via search, so a lookup failure is not a "track not found".
     const trackResults = await Promise.all(uris.map(async uri => {
         try {
             const result = await spotifyApi.getTrack(extractTrackId(uri));
@@ -69,7 +52,7 @@ async function validateTrackUris(uris) {
         } catch (err) {
             const status = err?.statusCode ?? err?.response?.statusCode;
             if (status === 403 || status === 429) {
-                console.warn(`[custom-playlists:validate] getTrack ${uri} returned ${status} — skipping explicit/banned check`);
+                console.warn(`[custom-playlists:validate] getTrack ${uri} returned ${status} — skipping banned check`);
                 return { track: null, skipped: true };
             }
             console.warn(`[custom-playlists:validate] getTrack ${uri} failed (${status ?? 'unknown'}):`, err?.message);
@@ -84,9 +67,8 @@ async function validateTrackUris(uris) {
 
     for (let i = 0; i < trackResults.length; i++) {
         const { track, skipped } = trackResults[i];
-        if (skipped) continue; // Spotify denied the lookup; trust the URI came from search
+        if (skipped) continue;
         if (!track) return { valid: false, error: `Track not found: ${uris[i]}` };
-        if (track.explicit) return { valid: false, error: `"${track.name}" is explicit and cannot be added` };
 
         const name = (track.name || '').trim().toLowerCase();
         const artist = (track.artists || []).map(a => a.name).join(', ').trim().toLowerCase();
@@ -105,7 +87,6 @@ function getCustomPlaylist(playlistDbId, userId) {
             [playlistDbId],
             (err, row) => {
                 if (err) return reject(err);
-                // Return null if not found or not owned — caller returns 403 (don't leak IDs)
                 if (!row || row.user_id !== Number(userId)) return resolve(null);
                 resolve(row);
             }
@@ -113,11 +94,11 @@ function getCustomPlaylist(playlistDbId, userId) {
     });
 }
 
-function getCustomPlaylistForClass(playlistDbId, classId) {
+function getCustomPlaylistById(playlistDbId) {
     return new Promise((resolve, reject) => {
         db.get(
-            'SELECT id, spotify_playlist_id, name, song_count, image_url, user_id, class_id FROM custom_playlists WHERE id = ? AND class_id IS ?',
-            [playlistDbId, classId],
+            'SELECT id, spotify_playlist_id, name, song_count, image_url, user_id FROM custom_playlists WHERE id = ?',
+            [playlistDbId],
             (err, row) => {
                 if (err) return reject(err);
                 resolve(row || null);
@@ -129,7 +110,6 @@ function getCustomPlaylistForClass(playlistDbId, classId) {
 function isSpotifyNotFoundError(err) {
     return err?.statusCode === 404 || err?.body?.error?.status === 404;
 }
-
 
 function deleteCustomPlaylistById(playlistDbId) {
     return new Promise((resolve, reject) => {
@@ -156,11 +136,7 @@ async function ensureCustomPlaylistExistsOrCleanup(playlistRow) {
 
     await ensureSpotifyAccessToken();
     try {
-        // areFollowingPlaylist was removed in the Feb 2026 Spotify API changes for Dev Mode apps.
-        // A successful getPlaylist response is sufficient to confirm the playlist still exists
-        // and is accessible — all custom playlists are owned by the Jukebar account.
         const playlistMeta = await spotifyApi.getPlaylist(playlistRow.spotify_playlist_id, { fields: 'id,images' });
-
         const imageUrl = playlistMeta.body?.images?.[0]?.url || null;
 
         if ((playlistRow.image_url || null) !== imageUrl) {
@@ -177,22 +153,20 @@ async function ensureCustomPlaylistExistsOrCleanup(playlistRow) {
     }
 }
 
-// GET /api/custom-playlists — list custom playlists for the caller's current class
+// GET /api/custom-playlists — list all custom playlists
 router.get('/api/custom-playlists', isAuthenticated, async (req, res) => {
-    const userId = req.session?.token?.id;
+    const userId = req.session?.userId;
     if (!userId) return res.status(401).json({ ok: false, error: 'Unauthorized' });
 
     try {
-        const classId = await getClassId();
         const rows = await new Promise((resolve, reject) => {
             db.all(
                 `SELECT cp.id, cp.spotify_playlist_id, cp.name, cp.song_count, cp.image_url, cp.created_at, cp.user_id,
-                        COALESCE(u.displayName, 'Unknown') as owner_name
+                        COALESCE(u.display_name, 'Unknown') as owner_name
                  FROM custom_playlists cp
                  LEFT JOIN users u ON u.id = cp.user_id
-                 WHERE cp.class_id IS ?
                  ORDER BY cp.created_at DESC`,
-                [classId],
+                [],
                 (err, rows) => err ? reject(err) : resolve(rows || [])
             );
         });
@@ -223,19 +197,8 @@ router.get('/api/custom-playlists', isAuthenticated, async (req, res) => {
 
 // POST /api/custom-playlists/create — create a playlist with a name + up to 5 initial songs
 router.post('/api/custom-playlists/create', isAuthenticated, async (req, res) => {
-    const userId = req.session?.token?.id;
+    const userId = req.session?.userId;
     if (!userId) return res.status(401).json({ ok: false, error: 'Unauthorized' });
-
-    const userIsOwner = isOwner(userId);
-
-    if (!userIsOwner) {
-        if (!req.session.hasPaid) {
-            return res.status(402).json({ ok: false, error: 'Payment required to create a playlist' });
-        }
-        if (req.session?.payment?.pendingAction !== 'createPlaylist') {
-            return res.status(409).json({ ok: false, error: 'Payment is not linked to playlist creation' });
-        }
-    }
 
     const userBanned = await getUserBanned(userId).catch(() => false);
     if (userBanned) return res.status(403).json({ ok: false, error: 'You have been banned from using Jukebar.' });
@@ -260,9 +223,6 @@ router.post('/api/custom-playlists/create', isAuthenticated, async (req, res) =>
         await ensureSpotifyAccessToken();
         const accessToken = spotifyApi.getAccessToken();
 
-        const classId = await getClassId();
-
-        // POST /users/{id}/playlists was removed for Dev Mode apps in Feb 2026; use /me/playlists instead
         const createRes = await fetch('https://api.spotify.com/v1/me/playlists', {
             method: 'POST',
             headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
@@ -293,19 +253,14 @@ router.post('/api/custom-playlists/create', isAuthenticated, async (req, res) =>
 
         const dbId = await new Promise((resolve, reject) => {
             db.run(
-                'INSERT INTO custom_playlists (user_id, class_id, spotify_playlist_id, name, song_count, image_url) VALUES (?, ?, ?, ?, ?, ?)',
-                [userId, classId, spotifyPlaylistId, trimmedName, trackUris.length, playlistImageUrl],
+                'INSERT INTO custom_playlists (user_id, spotify_playlist_id, name, song_count, image_url) VALUES (?, ?, ?, ?, ?)',
+                [userId, spotifyPlaylistId, trimmedName, trackUris.length, playlistImageUrl],
                 function (err) {
                     if (err) return reject(err);
                     resolve(this.lastID);
                 }
             );
         });
-
-        if (!userIsOwner) {
-            req.session.hasPaid = false;
-            req.session.payment = null;
-        }
 
         const username = typeof req.session.user === 'string' ? req.session.user : String(req.session.user || 'Unknown');
         await logTransaction({
@@ -315,20 +270,18 @@ router.post('/api/custom-playlists/create', isAuthenticated, async (req, res) =>
             trackURI: null,
             trackName: trimmedName,
             artistName: `${trackUris.length} initial track(s)`,
-            cost: userIsOwner ? 0 : CREATE_PLAYLIST_AMOUNT()
+            cost: 0
         }).catch(err => console.error('[custom-playlists:create] log failed:', err));
 
-        req.session.save(() => {
-            res.json({
-                ok: true,
-                playlist: {
-                    id: dbId,
-                    spotifyPlaylistId,
-                    name: trimmedName,
-                    songCount: trackUris.length,
-                    image: playlistImageUrl
-                }
-            });
+        res.json({
+            ok: true,
+            playlist: {
+                id: dbId,
+                spotifyPlaylistId,
+                name: trimmedName,
+                songCount: trackUris.length,
+                image: playlistImageUrl
+            }
         });
     } catch (err) {
         console.error('[custom-playlists:create]', err);
@@ -338,15 +291,14 @@ router.post('/api/custom-playlists/create', isAuthenticated, async (req, res) =>
 
 // GET /api/custom-playlists/:id/tracks — fetch tracks for a custom playlist
 router.get('/api/custom-playlists/:id/tracks', isAuthenticated, async (req, res) => {
-    const userId = req.session?.token?.id;
+    const userId = req.session?.userId;
     if (!userId) return res.status(401).json({ ok: false, error: 'Unauthorized' });
 
     const playlistDbId = parseInt(req.params.id);
     if (isNaN(playlistDbId)) return res.status(400).json({ ok: false, error: 'Invalid playlist ID' });
 
     try {
-        const classId = await getClassId();
-        const playlist = await getCustomPlaylistForClass(playlistDbId, classId);
+        const playlist = await getCustomPlaylistById(playlistDbId);
         if (!playlist) return res.status(403).json({ ok: false, error: 'Playlist not found' });
 
         const playlistCheck = await ensureCustomPlaylistExistsOrCleanup(playlist);
@@ -359,14 +311,12 @@ router.get('/api/custom-playlists/:id/tracks', isAuthenticated, async (req, res)
         let offset = 0;
         const limit = 100;
 
-        // /tracks was renamed to /items in the Feb 2026 Spotify API changes
         while (true) {
-            const res = await fetch(`https://api.spotify.com/v1/playlists/${playlist.spotify_playlist_id}/items?limit=${limit}&offset=${offset}`, {
+            const fetchRes = await fetch(`https://api.spotify.com/v1/playlists/${playlist.spotify_playlist_id}/items?limit=${limit}&offset=${offset}`, {
                 headers: { Authorization: `Bearer ${spotifyApi.getAccessToken()}` }
             });
-            const data = await res.json();
+            const data = await fetchRes.json();
             const items = data?.items || [];
-            // .track renamed to .item in the Feb 2026 Spotify API changes; support both
             tracks.push(...items.filter(item => {
                 const t = item?.item ?? item?.track;
                 return t && !t.is_local && t.uri?.startsWith('spotify:track:');
@@ -390,7 +340,7 @@ router.get('/api/custom-playlists/:id/tracks', isAuthenticated, async (req, res)
             playlist: {
                 id: playlistDbId,
                 name: playlist.name,
-                canEdit: true
+                canEdit: Number(playlist.user_id) === Number(userId)
             },
             tracks: simplified
         });
@@ -400,26 +350,10 @@ router.get('/api/custom-playlists/:id/tracks', isAuthenticated, async (req, res)
     }
 });
 
-// POST /api/custom-playlists/add-song — add a song to a custom playlist (100 digipogs)
+// POST /api/custom-playlists/add-song — add a song to a custom playlist
 router.post('/api/custom-playlists/add-song', isAuthenticated, async (req, res) => {
-    const userId = req.session?.token?.id;
+    const userId = req.session?.userId;
     if (!userId) return res.status(401).json({ ok: false, error: 'Unauthorized' });
-
-    const userIsOwner = isOwner(userId);
-
-    if (!userIsOwner) {
-        if (!req.session.hasPaid) {
-            return res.status(402).json({ ok: false, error: 'Payment required to add a song' });
-        }
-        if (req.session?.payment?.pendingAction !== 'addPlaylistSong') {
-            return res.status(409).json({ ok: false, error: 'Payment is not linked to adding a song' });
-        }
-        const paidPlaylistId = req.session?.payment?.playlistId;
-        const { playlistId } = req.body || {};
-        if (paidPlaylistId && String(paidPlaylistId) !== String(playlistId)) {
-            return res.status(409).json({ ok: false, error: 'Payment is not linked to this playlist' });
-        }
-    }
 
     const userBanned = await getUserBanned(userId).catch(() => false);
     if (userBanned) return res.status(403).json({ ok: false, error: 'You have been banned from using Jukebar.' });
@@ -431,8 +365,7 @@ router.post('/api/custom-playlists/add-song', isAuthenticated, async (req, res) 
     if (!isValidTrackUri(trackUri)) return res.status(400).json({ ok: false, error: 'Invalid track URI' });
 
     try {
-        const classId = await getClassId();
-        const playlist = await getCustomPlaylistForClass(playlistDbId, classId);
+        const playlist = await getCustomPlaylist(playlistDbId, userId);
         if (!playlist) return res.status(403).json({ ok: false, error: 'Playlist not found' });
 
         const playlistCheck = await ensureCustomPlaylistExistsOrCleanup(playlist);
@@ -462,11 +395,6 @@ router.post('/api/custom-playlists/add-song', isAuthenticated, async (req, res) 
             );
         });
 
-        if (!userIsOwner) {
-            req.session.hasPaid = false;
-            req.session.payment = null;
-        }
-
         const username = typeof req.session.user === 'string' ? req.session.user : String(req.session.user || 'Unknown');
         await logTransaction({
             userID: userId,
@@ -475,38 +403,20 @@ router.post('/api/custom-playlists/add-song', isAuthenticated, async (req, res) 
             trackURI: trackUri,
             trackName: playlist.name,
             artistName: 'Custom Playlist',
-            cost: userIsOwner ? 0 : ADD_PLAYLIST_SONG_AMOUNT()
+            cost: 0
         }).catch(err => console.error('[custom-playlists:add-song] log failed:', err));
 
-        req.session.save(() => {
-            res.json({ ok: true, message: 'Song added to playlist' });
-        });
+        res.json({ ok: true, message: 'Song added to playlist' });
     } catch (err) {
         console.error('[custom-playlists:add-song]', err);
         res.status(500).json({ ok: false, error: 'Failed to add song to playlist' });
     }
 });
 
-// POST /api/custom-playlists/remove-song — remove a song from a custom playlist (50 digipogs).
+// POST /api/custom-playlists/remove-song — remove a song from a custom playlist
 router.post('/api/custom-playlists/remove-song', isAuthenticated, async (req, res) => {
-    const userId = req.session?.token?.id;
+    const userId = req.session?.userId;
     if (!userId) return res.status(401).json({ ok: false, error: 'Unauthorized' });
-
-    const userIsOwner = isOwner(userId);
-
-    if (!userIsOwner) {
-        if (!req.session.hasPaid) {
-            return res.status(402).json({ ok: false, error: 'Payment required to remove a song' });
-        }
-        if (req.session?.payment?.pendingAction !== 'removePlaylistSong') {
-            return res.status(409).json({ ok: false, error: 'Payment is not linked to removing a song' });
-        }
-        const paidPlaylistId = req.session?.payment?.playlistId;
-        const { playlistId } = req.body || {};
-        if (paidPlaylistId && String(paidPlaylistId) !== String(playlistId)) {
-            return res.status(409).json({ ok: false, error: 'Payment is not linked to this playlist' });
-        }
-    }
 
     const userBanned = await getUserBanned(userId).catch(() => false);
     if (userBanned) return res.status(403).json({ ok: false, error: 'You have been banned from using Jukebar.' });
@@ -518,8 +428,7 @@ router.post('/api/custom-playlists/remove-song', isAuthenticated, async (req, re
     if (!isValidTrackUri(trackUri)) return res.status(400).json({ ok: false, error: 'Invalid track URI' });
 
     try {
-        const classId = await getClassId();
-        const playlist = await getCustomPlaylistForClass(playlistDbId, classId);
+        const playlist = await getCustomPlaylist(playlistDbId, userId);
         if (!playlist) return res.status(403).json({ ok: false, error: 'Playlist not found' });
 
         const playlistCheck = await ensureCustomPlaylistExistsOrCleanup(playlist);
@@ -544,11 +453,6 @@ router.post('/api/custom-playlists/remove-song', isAuthenticated, async (req, re
             );
         });
 
-        if (!userIsOwner) {
-            req.session.hasPaid = false;
-            req.session.payment = null;
-        }
-
         const username = typeof req.session.user === 'string' ? req.session.user : String(req.session.user || 'Unknown');
         await logTransaction({
             userID: userId,
@@ -557,48 +461,27 @@ router.post('/api/custom-playlists/remove-song', isAuthenticated, async (req, re
             trackURI: trackUri,
             trackName: playlist.name,
             artistName: 'Custom Playlist',
-            cost: userIsOwner ? 0 : REMOVE_PLAYLIST_SONG_AMOUNT()
+            cost: 0
         }).catch(err => console.error('[custom-playlists:remove-song] log failed:', err));
 
-        req.session.save(() => {
-            res.json({ ok: true, message: 'Song removed from playlist' });
-        });
+        res.json({ ok: true, message: 'Song removed from playlist' });
     } catch (err) {
         console.error('[custom-playlists:remove-song]', err);
         res.status(500).json({ ok: false, error: 'Failed to remove song from playlist' });
     }
 });
 
-// POST /api/custom-playlists/queue — start playback from one of the caller's custom playlists
+// POST /api/custom-playlists/queue — start playback from a custom playlist
 router.post('/api/custom-playlists/queue', isAuthenticated, playbackRateLimit(MODIFY), async (req, res) => {
-    const userId = req.session?.token?.id;
+    const userId = req.session?.userId;
     if (!userId) return res.status(401).json({ ok: false, error: 'Unauthorized' });
-    const userIsOwner = isOwner(userId);
 
     const { playlistId } = req.body || {};
     const playlistDbId = parseInt(playlistId);
     if (isNaN(playlistDbId)) return res.status(400).json({ ok: false, error: 'Invalid playlist ID' });
 
     try {
-        if (!userIsOwner) {
-            if (!req.session.hasPaid) {
-                return res.status(402).json({ ok: false, error: 'Payment required to play this playlist' });
-            }
-            if (req.session?.payment?.pendingAction !== 'customPlaylistPlay') {
-                return res.status(409).json({ ok: false, error: 'Payment is not linked to custom playlist playback' });
-            }
-            const paidPlaylistId = req.session?.payment?.playlistId;
-            if (paidPlaylistId && String(paidPlaylistId) !== String(playlistId)) {
-                return res.status(409).json({ ok: false, error: 'Payment is not linked to this playlist' });
-            }
-            const paidAmount = Number(req.session?.payment?.amount) || 0;
-            if (paidAmount < CUSTOM_PLAYLIST_PLAY_AMOUNT()) {
-                return res.status(409).json({ ok: false, error: 'Insufficient payment for playlist playback' });
-            }
-        }
-
-        const classId = await getClassId();
-        const playlist = await getCustomPlaylistForClass(playlistDbId, classId);
+        const playlist = await getCustomPlaylistById(playlistDbId);
         if (!playlist) return res.status(403).json({ ok: false, error: 'Playlist not found' });
 
         const playlistCheck = await ensureCustomPlaylistExistsOrCleanup(playlist);
@@ -632,18 +515,10 @@ router.post('/api/custom-playlists/queue', isAuthenticated, playbackRateLimit(MO
             trackURI: playlistUri,
             trackName: playlist.name,
             artistName: 'Custom Playlist',
-            cost: userIsOwner ? 0 : CUSTOM_PLAYLIST_PLAY_AMOUNT()
+            cost: 0
         }).catch(err => console.error('[custom-playlists:queue] log failed:', err));
 
-        if (!userIsOwner) {
-            req.session.hasPaid = false;
-            req.session.payment = null;
-            return req.session.save(() => {
-                res.json({ ok: true, message: `Started playlist playback (${playlist.name})` });
-            });
-        }
-
-        return res.json({ ok: true, message: `Started playlist playback (${playlist.name})` });
+        res.json({ ok: true, message: `Started playlist playback (${playlist.name})` });
     } catch (err) {
         console.error('[custom-playlists:queue]', err);
         res.status(500).json({ ok: false, error: 'Failed to play playlist' });

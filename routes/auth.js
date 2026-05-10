@@ -1,82 +1,110 @@
 const express = require('express');
 const router = express.Router();
-const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
 const db = require('../utils/database');
-const { setRawToken } = require('./socket');
 
-const FORMBAR_ADDRESS = process.env.FORMBAR_ADDRESS;
-const API_KEY = process.env.API_KEY || '';
-const port = process.env.PORT || 5000;
-const URL = process.env.URL || `http://localhost`;
-const AUTH_URL = `${FORMBAR_ADDRESS}/oauth`;
-const THIS_URL = `${URL}:${port}/login`;
+const SALT_ROUNDS = 12;
 
 router.get('/login', (req, res) => {
-    if (req.query.token) {
-        const rawToken = req.query.token; // Get the actual raw token
-        const tokenData = jwt.decode(rawToken);
-        
-        req.session.token = tokenData;
-        req.session.user = tokenData.displayName;
-        req.session.permission = tokenData.permissions;
-        req.session.rawToken = rawToken;
-        
-        // Set the token for WebSocket authentication
-        setRawToken(rawToken);
-        
-        // console.log('Token data:', tokenData);
-//console.log('User permission:', req.session.permission);
-        
-        // Update permission level on every login so it's available for ban checks
-        db.run("UPDATE users SET permission = ? WHERE id = ?", [tokenData.permissions || 2, tokenData.id]);
+    if (req.session.userId) {
+        const redirectTo = req.query.redirectURL || '/spotify';
+        return res.redirect(redirectTo);
+    }
+    res.render('login.ejs', { error: null, redirectURL: req.query.redirectURL || '/spotify' });
+});
 
-        db.run("INSERT INTO users (id, displayName, pin) VALUES (?, ?, ?)", [tokenData.id, tokenData.displayName, null], (err) => {
-            // if the table doesnt exist, create it
-            if (err && err.message.includes('no such table')) {
-                db.run("CREATE TABLE users (id INTEGER PRIMARY KEY, displayName TEXT, pin INTERGER)", (err) => {
-                    if (err) {
-                        console.error('Error creating users table:', err.message);
-                    } else {
-                        // try inserting again
-                        db.run("INSERT INTO users (id, displayName, pin) VALUES (?, ?, ?)", [tokenData.id, tokenData.displayName, null], (err) => {
-                            if (err) {
-                                if (err.message.includes('UNIQUE constraint failed')) {
-                                    // User already exists
-                                } else {
-                                    console.error('Database error:', err.message);
-                                }
-                            } else {
-//console.log('New user added to database');
-                            }
+router.post('/register', async (req, res) => {
+    const username = String(req.body.username || '').trim();
+    const password = String(req.body.password || '');
+    const displayName = String(req.body.displayName || req.body.username || '').trim();
+    const redirectTo = req.body.redirectURL || '/spotify';
+
+    if (!username || !password || !displayName) {
+        return res.render('login.ejs', {
+            error: 'Username, display name, and password are required.',
+            redirectURL: redirectTo
+        });
+    }
+    if (password.length < 4) {
+        return res.render('login.ejs', {
+            error: 'Password must be at least 4 characters.',
+            redirectURL: redirectTo
+        });
+    }
+
+    try {
+        const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
+
+        db.run(
+            'INSERT INTO users (username, password_hash, display_name, is_manager) VALUES (?, ?, ?, ?)',
+            [username, passwordHash, displayName, 0],
+            function (err) {
+                if (err) {
+                    if (err.message && err.message.includes('UNIQUE constraint failed')) {
+                        return res.render('login.ejs', {
+                            error: 'Username is already taken. Please choose another.',
+                            redirectURL: redirectTo
                         });
-                        const redirectTo = req.query.redirectURL || '/spotify';
-                        res.redirect(redirectTo);
                     }
-                });
-            } else if (err && err.message.includes('UNIQUE constraint failed')) {
-                const redirectTo = req.query.redirectURL || '/spotify';
-                res.redirect(redirectTo);
-            } else if (err) {
-                console.error('Database error:', err.message);
-                res.status(500).send('Database error');
-            } else {
-//console.log('New user added to database');
-                const redirectTo = req.query.redirectURL || '/spotify';
+                    console.error('Register DB error:', err.message);
+                    return res.render('login.ejs', {
+                        error: 'Registration failed. Please try again.',
+                        redirectURL: redirectTo
+                    });
+                }
+
+                req.session.userId = this.lastID;
+                req.session.user = displayName;
                 res.redirect(redirectTo);
             }
-        });
-    } else {
-        res.redirect(`${AUTH_URL}?redirectURL=${THIS_URL}`);
+        );
+    } catch (err) {
+        console.error('Register error:', err.message);
+        res.render('login.ejs', { error: 'Registration failed. Please try again.', redirectURL: redirectTo });
     }
 });
 
-function getRawToken(req) {
-    return req.session?.rawToken || null;
-}
+router.post('/login', (req, res) => {
+    const username = String(req.body.username || '').trim();
+    const password = String(req.body.password || '');
+    const redirectTo = req.body.redirectURL || '/spotify';
 
-router.get('/logout', (req, res) => {
-    res.redirect(`${AUTH_URL}?redirectURL=${THIS_URL}`);
-    req.session.destroy();
+    if (!username || !password) {
+        return res.render('login.ejs', {
+            error: 'Username and password are required.',
+            redirectURL: redirectTo
+        });
+    }
+
+    db.get('SELECT * FROM users WHERE username = ?', [username], async (err, user) => {
+        if (err) {
+            console.error('Login DB error:', err.message);
+            return res.render('login.ejs', { error: 'Login failed. Please try again.', redirectURL: redirectTo });
+        }
+        if (!user) {
+            return res.render('login.ejs', { error: 'Invalid username or password.', redirectURL: redirectTo });
+        }
+
+        try {
+            const match = await bcrypt.compare(password, user.password_hash);
+            if (!match) {
+                return res.render('login.ejs', { error: 'Invalid username or password.', redirectURL: redirectTo });
+            }
+
+            req.session.userId = user.id;
+            req.session.user = user.display_name;
+            res.redirect(redirectTo);
+        } catch (bcryptErr) {
+            console.error('Login bcrypt error:', bcryptErr.message);
+            res.render('login.ejs', { error: 'Login failed. Please try again.', redirectURL: redirectTo });
+        }
+    });
 });
 
-module.exports = { router, getRawToken };
+router.get('/logout', (req, res) => {
+    req.session.destroy(() => {
+        res.redirect('/login');
+    });
+});
+
+module.exports = { router };

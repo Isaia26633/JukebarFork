@@ -5,9 +5,7 @@ const db = require('../utils/database');
 const { logTransaction } = require('./logging');
 const queueManager = require('../utils/queueManager');
 const { isAuthenticated } = require('../middleware/auth');
-const { isOwner, getFirstOwnerId } = require('../utils/owners');
-const { refund: poolRefund } = require('../utils/transferManager');
-const { getCurrentClassId, requestAndWaitForClassId } = require('./socket');
+const { getCurrentClassId } = require('./socket');
 const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
@@ -19,6 +17,15 @@ const {
     executePlaybackModify,
     setSpotifyPlaybackCooldown
 } = require('../middleware/spotifyPlaybackRateLimit');
+
+/** Push Spotify state to all sockets soon after a playback-changing action. */
+function scheduleImmediateSpotifyQueueSync() {
+    setImmediate(() => {
+        queueManager.syncWithSpotify(spotifyApi).catch((err) => {
+            console.warn('[queue] immediate Spotify sync:', err?.message || err);
+        });
+    });
+}
 
 // Play random sound from /sfx folder
 let isPlayingSound = false;
@@ -47,7 +54,7 @@ function shouldAprilFool() {
 }
 
 function getSearchRequesterKey(req) {
-    return String(req.session?.token?.id || req.ip || 'anonymous');
+    return String(req.session?.userId || req.ip || 'anonymous');
 }
 
 function pruneSearchBurstTimestamps(requesterKey, now) {
@@ -133,14 +140,6 @@ function playRandomBlockedSound() {
         return null;
     }
 }
-
-// Middleware to check if user has teacher permissions (owner or permission >= 4)
-const requireTeacherAccess = (req, res, next) => {
-    if (req.session?.permission >= 4 || isOwner(req.session?.token?.id)) {
-        return next();
-    }
-    return res.status(403).json({ ok: false, error: 'Insufficient permissions' });
-};
 
 // Helpers for banned songs
 function getBannedSongs() {
@@ -264,148 +263,6 @@ function formatSpotifyErrorForLog(error) {
     return `[${status}] ${message}${body}`;
 }
 
-/**
- * Resolves the current class ID. Uses cached value if available,
- * otherwise asks Formbar for it via socket. Returns null if unavailable —
- * callers treat null as "default/no class" which still works with the DB.
- */
-async function getClassId() {
-    const cached = getCurrentClassId();
-    if (cached !== null && cached !== undefined) return cached;
-    const fetched = await requestAndWaitForClassId();
-    return fetched ?? null;
-}
-
-// SQLite helper: NULL-safe class_id comparison.
-// "class_id = ?" fails when ? is NULL because NULL = NULL → false.
-// This uses "class_id IS ?" which handles NULL correctly.
-const CLASS_ID_WHERE = 'class_id IS ?';
-
-function getAllowedPlaylist(playlistId, classId) {
-    return new Promise((resolve, reject) => {
-        db.get(
-            `SELECT spotify_playlist_id, name, owner_name, image_url, total_tracks, is_allowed
-             FROM allowed_playlists
-             WHERE spotify_playlist_id = ? AND ${CLASS_ID_WHERE}`,
-            [playlistId, classId],
-            (err, row) => {
-                if (err) return reject(err);
-                resolve(row || null);
-            }
-        );
-    });
-}
-
-function getAllowedPlaylists(classId) {
-    return new Promise((resolve, reject) => {
-        db.all(
-            `SELECT spotify_playlist_id, name, owner_name, image_url, total_tracks
-             FROM allowed_playlists
-             WHERE is_allowed = 1 AND ${CLASS_ID_WHERE}
-             GROUP BY spotify_playlist_id
-             ORDER BY lower(name) ASC`,
-            [classId],
-            (err, rows) => {
-                if (err) return reject(err);
-                resolve(rows || []);
-            }
-        );
-    });
-}
-
-function getAllowedPlaylistMap(classId) {
-    return new Promise((resolve, reject) => {
-        db.all(
-            `SELECT spotify_playlist_id, MAX(is_allowed) as is_allowed
-             FROM allowed_playlists
-             WHERE ${CLASS_ID_WHERE}
-             GROUP BY spotify_playlist_id`,
-            [classId], (err, rows) => {
-            if (err) return reject(err);
-            const allowedMap = new Map();
-            (rows || []).forEach((row) => {
-                allowedMap.set(row.spotify_playlist_id, !!row.is_allowed);
-            });
-            resolve(allowedMap);
-        });
-    });
-}
-
-function upsertPlaylistMetadata(playlist, updatedBy = null, classId = null) {
-    return new Promise((resolve, reject) => {
-        // Use LIMIT 1 since UNIQUE constraint doesn't prevent NULL duplicates
-        db.get(
-            `SELECT id FROM allowed_playlists WHERE spotify_playlist_id = ? AND ${CLASS_ID_WHERE} LIMIT 1`,
-            [playlist.id, classId],
-            (err, row) => {
-                if (err) return reject(err);
-                if (row) {
-                    db.run(
-                        `UPDATE allowed_playlists
-                         SET name = ?, owner_name = ?, image_url = ?, total_tracks = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP
-                         WHERE id = ?`,
-                        [
-                            playlist.name || 'Untitled Playlist',
-                            playlist.owner || 'Unknown',
-                            playlist.image || null,
-                            Number(playlist.totalTracks) || 0,
-                            updatedBy || null,
-                            row.id
-                        ],
-                        (err) => {
-                            if (err) return reject(err);
-                            resolve();
-                        }
-                    );
-                } else {
-                    db.run(
-                        `INSERT INTO allowed_playlists
-                         (spotify_playlist_id, name, owner_name, image_url, total_tracks, updated_by, updated_at, class_id)
-                         VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)`,
-                        [
-                            playlist.id,
-                            playlist.name || 'Untitled Playlist',
-                            playlist.owner || 'Unknown',
-                            playlist.image || null,
-                            Number(playlist.totalTracks) || 0,
-                            updatedBy || null,
-                            classId
-                        ],
-                        (err) => {
-                            if (err) return reject(err);
-                            resolve();
-                        }
-                    );
-                }
-            }
-        );
-    });
-}
-
-function setPlaylistAllowedState(playlistId, isAllowed, teacherId, classId) {
-    return new Promise((resolve, reject) => {
-        // Update only the first matching row (handles NULL class_id duplicates)
-        db.get(
-            `SELECT id FROM allowed_playlists WHERE spotify_playlist_id = ? AND ${CLASS_ID_WHERE} LIMIT 1`,
-            [playlistId, classId],
-            (err, row) => {
-                if (err) return reject(err);
-                if (!row) return resolve(0);
-                db.run(
-                    `UPDATE allowed_playlists
-                     SET is_allowed = ?, updated_by = ?, updated_at = CURRENT_TIMESTAMP
-                     WHERE id = ?`,
-                    [isAllowed ? 1 : 0, teacherId || null, row.id],
-                    function (err) {
-                        if (err) return reject(err);
-                        resolve(this.changes || 0);
-                    }
-                );
-            }
-        );
-    });
-}
-
 async function fetchAllUserPlaylists() {
     const allItems = [];
     const limit = 50;
@@ -422,33 +279,32 @@ async function fetchAllUserPlaylists() {
     return allItems;
 }
 
-function pruneAllowedPlaylistsNotInLibrary(classId, playlistIds) {
-    return new Promise((resolve, reject) => {
-        const uniqueIds = [...new Set((playlistIds || []).filter(Boolean))];
-
-        if (uniqueIds.length === 0) {
-            return db.run(
-                `DELETE FROM allowed_playlists WHERE ${CLASS_ID_WHERE}`,
-                [classId],
-                function (err) {
-                    if (err) return reject(err);
-                    resolve(this.changes || 0);
-                }
-            );
-        }
-
-        const placeholders = uniqueIds.map(() => '?').join(',');
-        db.run(
-            `DELETE FROM allowed_playlists
-             WHERE ${CLASS_ID_WHERE}
-               AND spotify_playlist_id NOT IN (${placeholders})`,
-            [classId, ...uniqueIds],
-            function (err) {
-                if (err) return reject(err);
-                resolve(this.changes || 0);
-            }
+/** Spotify Connect device for pause/play when the active target is ambiguous. */
+async function resolveSpotifyDeviceId(req) {
+    let deviceId = null;
+    try {
+        const stateRes = await executePlaybackRead(req, 'playback-device-state', () =>
+            spotifyApi.getMyCurrentPlaybackState()
         );
-    });
+        deviceId = stateRes?.body?.device?.id || null;
+    } catch (e) {
+        console.warn('[spotify] getMyCurrentPlaybackState:', e?.message || e);
+    }
+    if (!deviceId) {
+        try {
+            const devRes = await executePlaybackRead(req, 'playback-device-list', () => spotifyApi.getMyDevices());
+            const list = devRes?.body?.devices || [];
+            const active = list.find((d) => d.is_active);
+            deviceId = active?.id || list[0]?.id || null;
+        } catch (e) {
+            console.warn('[spotify] getMyDevices:', e?.message || e);
+        }
+    }
+    return deviceId;
+}
+
+function spotifyRestrictionErrorMessage() {
+    return 'Spotify refused this playback command. Common causes: Spotify Premium is required for Web API control, the account cannot control this device, or ads are playing. Try another Spotify Connect device or the official Spotify app.';
 }
 
 async function fetchPlaylistTracks(playlistId) {
@@ -771,12 +627,10 @@ router.post('/search', async (req, res) => {
             explicit: t.explicit,
             duration_ms: t.duration_ms
         }));
-        // filter explicit songs and songs longer than 7 minutes
-        simplified = simplified.filter(t => t.explicit === false && t.duration_ms < 420000);
 
         // if the song is banned hide it
         const isTeacherPanel = source === 'teacher';
-        const isTeacher = (req.session?.permission >= 4 || isOwner(req.session?.token?.id));
+        const isTeacher = (req.session?.isManager === true || true);
         try {
             const banned = await getBannedSongs();
             // Use function to check if track name starts with banned name and artist matches
@@ -858,7 +712,7 @@ router.post('/search', async (req, res) => {
 });
 
 router.get('/recentlyQueued', async (req, res) => {
-    if (!req.session?.token?.id) {
+    if (!req.session?.userId) {
         return res.status(401).json({ ok: false, error: 'Unauthorized' });
     }
 
@@ -870,7 +724,7 @@ router.get('/recentlyQueued', async (req, res) => {
                  WHERE t.user_id = ? AND t.action IN ('play', 'artist_click', 'album_click')
                    AND (u.recently_queued_cleared_at IS NULL OR t.timestamp > u.recently_queued_cleared_at)
                  ORDER BY t.timestamp DESC LIMIT 200`,
-                [req.session.token.id],
+                [req.session.userId],
                 (err, rows) => err ? reject(err) : resolve(rows || [])
             );
         });
@@ -910,7 +764,7 @@ router.get('/recentlyQueued', async (req, res) => {
 });
 
 router.post('/recentlyQueued/interactions', isAuthenticated, async (req, res) => {
-    const userId = req.session?.token?.id;
+    const userId = req.session?.userId;
     if (!userId) {
         return res.status(401).json({ ok: false, error: 'Unauthorized' });
     }
@@ -952,7 +806,7 @@ router.post('/recentlyQueued/interactions', isAuthenticated, async (req, res) =>
 });
 
 router.post('/clearQueueHistory', async (req, res) => {
-    if (!req.session?.token?.id) {
+    if (!req.session?.userId) {
         return res.status(401).json({ ok: false, error: 'Unauthorized' });
     }
 
@@ -960,7 +814,7 @@ router.post('/clearQueueHistory', async (req, res) => {
         await new Promise((resolve, reject) => {
             db.run(
                 `UPDATE users SET recently_queued_cleared_at = datetime('now') WHERE id = ?`,
-                [req.session.token.id],
+                [req.session.userId],
                 (err) => err ? reject(err) : resolve()
             );
         });
@@ -968,7 +822,7 @@ router.post('/clearQueueHistory', async (req, res) => {
         // Emit socket event to notify the user their history was cleared
         const io = req.app.get('io');
         if (io) {
-            io.to(`user:${req.session.token.id}`).emit('queueHistoryUpdated', { userId: req.session.token.id });
+            io.to(`user:${req.session.userId}`).emit('queueHistoryUpdated', { userId: req.session.userId });
         }
 
         return res.json({ ok: true, message: 'Queue history cleared' });
@@ -978,8 +832,8 @@ router.post('/clearQueueHistory', async (req, res) => {
     }
 });
 
-// Teacher-only: clear recently queued for ALL users (transactions stay intact)
-router.post('/clearAllRecentlyQueued', isAuthenticated, requireTeacherAccess, async (req, res) => {
+// Clear recently queued for ALL users (transactions stay intact)
+router.post('/clearAllRecentlyQueued', isAuthenticated, async (req, res) => {
     try {
         await new Promise((resolve, reject) => {
             db.run(
@@ -998,122 +852,28 @@ router.post('/clearAllRecentlyQueued', isAuthenticated, requireTeacherAccess, as
     }
 });
 
-router.get('/api/spotify/playlists', isAuthenticated, requireTeacherAccess, async (req, res) => {
-    try {
-        await ensureSpotifyAccessToken();
-        const classId = await getClassId();
-
-        const [items, meData] = await Promise.all([
-            fetchAllUserPlaylists(),
-            spotifyApi.getMe().catch(() => null)
-        ]);
-        const myId = meData?.body?.id;
-
-        const removedCount = await pruneAllowedPlaylistsNotInLibrary(
-            classId,
-            items.map((playlist) => playlist?.id)
-        );
-        if (removedCount > 0) {
-            console.log(`[playlist:sync] Removed ${removedCount} stale allowed playlist row(s) for classId=${classId}`);
-        }
-
-        const allowedMap = await getAllowedPlaylistMap(classId);
-
-        const playlists = items.map((playlist) => {
-            const ownerId = playlist.owner?.id;
-            const collaborative = !!playlist.collaborative;
-            const formatted = {
-            id: playlist.id,
-            name: playlist.name || 'Untitled Playlist',
-            totalTracks: playlist.items?.total ?? playlist.tracks?.total ?? 0,
-            image: playlist.images?.[0]?.url || null,
-            owner: playlist.owner?.display_name || ownerId || 'Unknown',
-            url: playlist.external_urls?.spotify || null,
-            uri: playlist.uri,
-            isAllowed: allowedMap.get(playlist.id) || false,
-            canAccessTracks: (myId && ownerId === myId) || collaborative
-            };
-            return formatted;
-        });
-
-        await Promise.all(playlists.map((playlist) => upsertPlaylistMetadata(playlist, req.session?.token?.id, classId)));
-
-        return res.json({ ok: true, playlists });
-    } catch (err) {
-        return handleSpotifyError(err, res, 'fetch playlists');
-    }
-});
-
-router.post('/api/spotify/playlists/allow', isAuthenticated, requireTeacherAccess, async (req, res) => {
-    try {
-        const { playlistId, name, owner, image, totalTracks } = req.body || {};
-        if (!playlistId) {
-            return res.status(400).json({ ok: false, error: 'playlistId is required' });
-        }
-
-        const classId = await getClassId();
-        const teacherId = req.session?.token?.id;
-
-        await upsertPlaylistMetadata({
-            id: playlistId,
-            name,
-            owner,
-            image,
-            totalTracks
-        }, teacherId, classId);
-
-        const changes = await setPlaylistAllowedState(playlistId, true, teacherId, classId);
-        if (!changes) {
-            console.warn(`[playlist:allow] 0 rows updated — playlistId=${playlistId} classId=${classId}`);
-        }
-
-        return res.json({ ok: true, message: 'Playlist allowed' });
-    } catch (err) {
-        console.error('[playlist:allow]', err);
-        return res.status(500).json({ ok: false, error: 'Failed to allow playlist' });
-    }
-});
-
-router.post('/api/spotify/playlists/disallow', isAuthenticated, requireTeacherAccess, async (req, res) => {
-    try {
-        const { playlistId } = req.body || {};
-        if (!playlistId) {
-            return res.status(400).json({ ok: false, error: 'playlistId is required' });
-        }
-
-        const classId = await getClassId();
-        const teacherId = req.session?.token?.id;
-        console.log(`[playlist:disallow] teacher=${teacherId} playlistId=${playlistId} classId=${classId}`);
-
-        const changes = await setPlaylistAllowedState(playlistId, false, teacherId, classId);
-        console.log(`[playlist:disallow] setAllowedState result: ${changes} row(s) updated`);
-        if (!changes) {
-            return res.status(404).json({ ok: false, error: 'Playlist not found' });
-        }
-
-        return res.json({ ok: true, message: 'Playlist disallowed' });
-    } catch (err) {
-        console.error('[playlist:disallow] error:', err);
-        return res.status(500).json({ ok: false, error: 'Failed to disallow playlist' });
-    }
-});
-
+/** Spotify playlists visible to the linked account (for player sidebar). */
 router.get('/api/playlists/allowed', isAuthenticated, async (req, res) => {
     try {
-        const classId = await getClassId();
-        const rows = await getAllowedPlaylists(classId);
-        const playlists = rows.map((row) => ({
-            id: row.spotify_playlist_id,
-            name: row.name || 'Untitled Playlist',
-            owner: row.owner_name || 'Unknown',
-            image: row.image_url || null,
-            totalTracks: Number(row.total_tracks) || 0
-        }));
-
+        if (!process.env.SPOTIFY_CLIENT_ID) {
+            return res.json({ ok: true, playlists: [] });
+        }
+        await ensureSpotifyAccessToken();
+        const items = await fetchAllUserPlaylists();
+        const playlists = items.map((playlist) => {
+            const ownerId = playlist.owner?.id;
+            return {
+                id: playlist.id,
+                name: playlist.name || 'Untitled Playlist',
+                owner: playlist.owner?.display_name || ownerId || 'Unknown',
+                image: playlist.images?.[0]?.url || null,
+                totalTracks: playlist.tracks?.total ?? 0
+            };
+        });
+        playlists.sort((a, b) => String(a.name).toLowerCase().localeCompare(String(b.name).toLowerCase()));
         return res.json({ ok: true, playlists });
     } catch (err) {
-        console.error('Get allowed playlists error:', err);
-        return res.status(500).json({ ok: false, error: 'Failed to fetch allowed playlists' });
+        return handleSpotifyError(err, res, 'fetch playlists for player');
     }
 });
 
@@ -1156,13 +916,14 @@ router.post('/api/playlists/quote', isAuthenticated, async (req, res) => {
             return res.status(400).json({ ok: false, error: 'playlistId is required' });
         }
 
-        const classId = await getClassId();
-        const allowedRow = await getAllowedPlaylist(playlistId, classId);
-        if (!allowedRow || !allowedRow.is_allowed) {
-            return res.status(403).json({ ok: false, error: 'This playlist is not allowed' });
+        await ensureSpotifyAccessToken();
+        let playlistMeta;
+        try {
+            playlistMeta = await spotifyApi.getPlaylist(playlistId);
+        } catch (err) {
+            return handleSpotifyError(err, res, 'quote playlist');
         }
 
-        await ensureSpotifyAccessToken();
         const fetchResult = await fetchPlaylistTracks(playlistId);
         if (fetchResult.error) {
             const fe = fetchResult.error;
@@ -1175,7 +936,6 @@ router.post('/api/playlists/quote', isAuthenticated, async (req, res) => {
             return res.status(409).json({ ok: false, code: 'PLAYLIST_ALREADY_PLAYING', error: 'This playlist is already playing' });
         }
 
-        const playlistMeta = await spotifyApi.getPlaylist(playlistId);
         const quote = buildPlaylistQuoteFromItems(rawItems);
         const queueableCount = quote.playableCount;
         const cost = computePlaylistCost(queueableCount);
@@ -1185,7 +945,7 @@ router.post('/api/playlists/quote', isAuthenticated, async (req, res) => {
             ok: true,
             playlist: {
                 id: playlistId,
-                name: playlistMeta.body?.name || allowedRow.name || 'Untitled Playlist'
+                name: playlistMeta.body?.name || 'Untitled Playlist'
             },
             queueableCount,
             tracks: quote.preview,
@@ -1205,7 +965,7 @@ router.post('/api/playlists/quote', isAuthenticated, async (req, res) => {
 
 router.post('/api/playlists/queue', isAuthenticated, playbackRateLimit(MODIFY), async (req, res) => {
     try {
-        const userId = req.session?.token?.id;
+        const userId = req.session?.userId;
         if (!userId) {
             return res.status(401).json({ ok: false, error: 'Unauthorized' });
         }
@@ -1215,20 +975,12 @@ router.post('/api/playlists/queue', isAuthenticated, playbackRateLimit(MODIFY), 
             return res.status(400).json({ ok: false, error: 'playlistId is required' });
         }
 
-        const classId = await getClassId();
-        const allowedRow = await getAllowedPlaylist(playlistId, classId);
-        console.log(`[playlist:queue] userId=${userId} playlistId=${playlistId} classId=${classId} allowedRow=${JSON.stringify(allowedRow)}`);
-        if (!allowedRow || !allowedRow.is_allowed) {
-            console.warn(`[playlist:queue] Blocked — playlist not allowed. allowedRow=${JSON.stringify(allowedRow)} classId=${classId}`);
-            return res.status(403).json({ ok: false, error: 'This playlist is not allowed' });
-        }
-
         const alreadyPlaying = await isPlaylistCurrentlyPlaying(playlistId);
         if (alreadyPlaying) {
             return res.status(409).json({ ok: false, code: 'PLAYLIST_ALREADY_PLAYING', error: 'This playlist is already playing' });
         }
 
-        const userIsOwner = isOwner(userId);
+        const userIsOwner = true;
 
         if (!userIsOwner) {
             const userBanned = await new Promise((resolve, reject) => {
@@ -1241,7 +993,7 @@ router.post('/api/playlists/queue', isAuthenticated, playbackRateLimit(MODIFY), 
                 return res.status(403).json({ ok: false, error: 'You have been banned from using Jukebar. Contact your teacher.' });
             }
 
-            if (!req.session.hasPaid) {
+            if (!true) {
                 return res.status(402).json({ ok: false, error: 'Payment required to play playlist' });
             }
 
@@ -1287,12 +1039,6 @@ router.post('/api/playlists/queue', isAuthenticated, playbackRateLimit(MODIFY), 
             console.warn('Playlist playback started but queue sync failed:', syncErr.message);
         }
 
-        if (!userIsOwner) {
-            db.run('UPDATE users SET songsPlayed = songsPlayed + ? WHERE id = ?', [queueableCount, userId], (err) => {
-                if (err) console.error('Error updating songs played for playlist:', err);
-            });
-        }
-
         await logTransaction({
             userID: userId,
             displayName: username,
@@ -1300,28 +1046,22 @@ router.post('/api/playlists/queue', isAuthenticated, playbackRateLimit(MODIFY), 
             trackURI: playlistMeta.body?.uri || null,
             trackName: playlistMeta.body?.name || allowedRow.name || 'Playlist',
             artistName: `${queueableCount} tracks in playlist`,
-            cost: userIsOwner ? 0 : expectedCost
+            cost: 0
         });
 
-        if (!userIsOwner) {
-            req.session.hasPaid = false;
-            req.session.payment = null;
-        }
-        req.session.save(() => {
-            res.json({
-                ok: true,
-                queuedCount: queueableCount,
-                skipped: playlistStats.skipped,
-                cost: userIsOwner ? 0 : expectedCost,
-                message: `Started playlist playback (${queueableCount} tracks)`
-            });
+        res.json({
+            ok: true,
+            queuedCount: queueableCount,
+            skipped: playlistStats.skipped,
+            cost: 0,
+            message: `Started playlist playback (${queueableCount} tracks)`
         });
     } catch (err) {
         return handleSpotifyError(err, res, 'queue playlist');
     }
 });
 
-router.post('/unbanTrack', isAuthenticated, requireTeacherAccess, async (req, res) => {
+router.post('/unbanTrack', isAuthenticated, async (req, res) => {
     try {
         const { name, artist } = req.body || {};
         if (!name || !artist) return res.status(400).json({ ok: false, error: 'Missing track name or artist' });
@@ -1345,7 +1085,7 @@ router.post('/unbanTrack', isAuthenticated, requireTeacherAccess, async (req, re
 });
 
 // Teacher-only: Ban a track by name/artist (optionally record URI)
-router.post('/banTrack', isAuthenticated, requireTeacherAccess, async (req, res) => {
+router.post('/banTrack', isAuthenticated, async (req, res) => {
     try {
         const { name, artist, reason, uri, image } = req.body || {};
         if (!name || !artist) return res.status(400).json({ ok: false, error: 'Missing track name or artist' });
@@ -1354,7 +1094,7 @@ router.post('/banTrack', isAuthenticated, requireTeacherAccess, async (req, res)
         if (!banReason) return res.status(400).json({ ok: false, error: 'Ban reason is required' });
         if (banReason.length > 200) return res.status(400).json({ ok: false, error: 'Ban reason must be 200 characters or fewer' });
 
-        const bannedBy = req.session?.token?.id;
+        const bannedBy = req.session?.userId;
         if (!bannedBy) {
             return res.status(401).json({ ok: false, error: 'Missing user token id' });
         }
@@ -1482,12 +1222,12 @@ router.get('/getQueue', playbackRateLimit(READ), async (req, res) => {
 });
 
 router.post('/addToQueue', playbackRateLimit(MODIFY), async (req, res) => {
-    //console.log('addToQueue - Session:', req.session?.token?.id, 'hasPaid:', req.session?.hasPaid);
-    if (!req.session || !req.session.token || !req.session.token.id) {
+    //console.log('addToQueue - Session:', req.session?.userId, 'hasPaid:', true);
+    if (!req.session || !req.session.userId) {
         return res.status(401).json({ ok: false, error: 'Unauthorized' });
     }
 
-    if (isOwner(req.session.token.id)) {
+    if (true) {
         try {
             await ensureSpotifyAccessToken();
 
@@ -1545,9 +1285,9 @@ router.post('/addToQueue', playbackRateLimit(MODIFY), async (req, res) => {
             //console.log('Saving to DB - URI:', track.uri, 'addedBy:', username);
             await new Promise((resolve, reject) => {
                 db.run(
-                    `INSERT INTO queue_metadata (track_uri, added_by, added_at, display_name, is_anon, skip_shields) 
-                 VALUES (?, ?, ?, ?, ?, ?)`,
-                    [track.uri, username, Date.now(), username, isAnon, 0],
+                    `INSERT INTO queue_metadata (track_uri, added_by, added_at, display_name, is_anon)
+                 VALUES (?, ?, ?, ?, ?)`,
+                    [track.uri, username, Date.now(), username, isAnon],
                     function (err) {
                         if (err) {
                             console.error('Failed to save queue metadata:', err);
@@ -1568,9 +1308,9 @@ router.post('/addToQueue', playbackRateLimit(MODIFY), async (req, res) => {
                 );
             });
 
-            if (anonMode !== 1 && !isOwner(req.session.token?.id)) {
+            if (anonMode !== 1 && !true) {
                 db.run(
-                    "UPDATE users SET songsPlayed = songsPlayed + 1 WHERE id = ?", [req.session.token?.id],
+                    "UPDATE users SET songsPlayed = songsPlayed + 1 WHERE id = ?", [req.session?.userId],
                     (err) => {
                         if (err) console.error('Error updating songs played:', err);
                     }
@@ -1579,7 +1319,7 @@ router.post('/addToQueue', playbackRateLimit(MODIFY), async (req, res) => {
 
             // Log transaction for owners (cost 0)
             await logTransaction({
-                userID: req.session.token.id,
+                userID: req.session.userId,
                 displayName: req.session.user,
                 action: 'play',
                 trackURI: trackInfo.uri,
@@ -1592,7 +1332,7 @@ router.post('/addToQueue', playbackRateLimit(MODIFY), async (req, res) => {
             // Notify the queuing user's sockets that their recently queued list changed
             const io = req.app.get('io');
             if (io) {
-                io.to(`user:${req.session.token.id}`).emit('recentlyQueuedUpdate', {
+                io.to(`user:${req.session.userId}`).emit('recentlyQueuedUpdate', {
                     name: trackInfo.name,
                     artist: trackInfo.artist,
                     uri: trackInfo.uri,
@@ -1600,7 +1340,8 @@ router.post('/addToQueue', playbackRateLimit(MODIFY), async (req, res) => {
                 });
             }
 
-            //console.log(`Add to queue successful for owner (ID: ${req.session.token.id})`);
+            scheduleImmediateSpotifyQueueSync();
+            //console.log(`Add to queue successful for owner (ID: ${req.session.userId})`);
             res.json({ success: true, message: "Track queued!", trackInfo });
             return;
         } catch (err) {
@@ -1610,7 +1351,7 @@ router.post('/addToQueue', playbackRateLimit(MODIFY), async (req, res) => {
 
     // For non-admin users, check if banned
     const userBanned = await new Promise((resolve, reject) => {
-        db.get("SELECT COALESCE(isBanned, 0) as isBanned FROM users WHERE id = ?", [req.session.token.id], (err, row) => {
+        db.get("SELECT COALESCE(isBanned, 0) as isBanned FROM users WHERE id = ?", [req.session.userId], (err, row) => {
             if (err) reject(err);
             else resolve(row && row.isBanned === 1);
         });
@@ -1620,7 +1361,7 @@ router.post('/addToQueue', playbackRateLimit(MODIFY), async (req, res) => {
     }
 
     // Check for duplicates BEFORE payment (for non-teachers)
-    const isTeacher = req.session.permission >= 4 || isOwner(req.session.token.id);
+    const isTeacher = req.session?.isManager === true;
     if (!isTeacher) {
         const { uri } = req.body;
         if (uri) {
@@ -1632,8 +1373,8 @@ router.post('/addToQueue', playbackRateLimit(MODIFY), async (req, res) => {
     }
 
     // For non-admin users, check payment
-    if (!req.session.hasPaid) {
-        //console.log('addToQueue - Payment required. User ID:', req.session.token.id, 'hasPaid:', req.session.hasPaid);
+    if (!true) {
+        //console.log('addToQueue - Payment required. User ID:', req.session.userId, 'hasPaid:', true);
         return res.status(403).json({ ok: false, error: 'Payment required to add to queue' });
     }
 
@@ -1696,9 +1437,9 @@ router.post('/addToQueue', playbackRateLimit(MODIFY), async (req, res) => {
         //console.log('Saving to DB - URI:', track.uri, 'addedBy:', username2, 'type:', typeof username2);
         await new Promise((resolve, reject) => {
             db.run(
-                `INSERT INTO queue_metadata (track_uri, added_by, added_at, display_name, is_anon, skip_shields) 
-                 VALUES (?, ?, ?, ?, ?, ?)`,
-                [track.uri, username2, Date.now(), username2, isAnon, 0],
+                `INSERT INTO queue_metadata (track_uri, added_by, added_at, display_name, is_anon)
+                 VALUES (?, ?, ?, ?, ?)`,
+                [track.uri, username2, Date.now(), username2, isAnon],
                 function (err) {
                     if (err) {
                         console.error('Failed to save queue metadata:', err);
@@ -1719,9 +1460,9 @@ router.post('/addToQueue', playbackRateLimit(MODIFY), async (req, res) => {
             );
         });
 
-        if (anonMode !== 1 && !isOwner(req.session.token?.id)) {
+        if (anonMode !== 1 && !true) {
             db.run(
-                "UPDATE users SET songsPlayed = songsPlayed + 1 WHERE id = ?", [req.session.token?.id],
+                "UPDATE users SET songsPlayed = songsPlayed + 1 WHERE id = ?", [req.session?.userId],
                 (err) => {
                     if (err) console.error('Error updating songs played:', err);
                 }
@@ -1730,7 +1471,7 @@ router.post('/addToQueue', playbackRateLimit(MODIFY), async (req, res) => {
 
         // Log the transaction - ALWAYS log, not just when currentTrack exists
         await logTransaction({
-            userID: req.session.token.id,
+            userID: req.session.userId,
             displayName: req.session.user,
             action: 'play',
             trackURI: trackInfo.uri,
@@ -1741,18 +1482,18 @@ router.post('/addToQueue', playbackRateLimit(MODIFY), async (req, res) => {
         });
 
         // Clear payment flag after successful queue addition
-        req.session.hasPaid = false;
         req.session.save(() => {
             // Notify the queuing user's sockets that their recently queued list changed
             const io = req.app.get('io');
             if (io) {
-                io.to(`user:${req.session.token.id}`).emit('recentlyQueuedUpdate', {
+                io.to(`user:${req.session.userId}`).emit('recentlyQueuedUpdate', {
                     name: trackInfo.name,
                     artist: trackInfo.artist,
                     uri: trackInfo.uri,
                     album: { name: '', image: trackInfo.cover }
                 });
             }
+            scheduleImmediateSpotifyQueueSync();
             res.json({ success: true, message: "Track queued!", trackInfo });
         });
 
@@ -1814,220 +1555,112 @@ router.get('/currentlyPlaying', playbackRateLimit(READ), async (req, res) => {
 });
 
 router.post('/skip', playbackRateLimit(MODIFY), async (req, res) => {
-    //console.log('skip - Session:', req.session?.token?.id, 'hasPaid:', req.session?.hasPaid);
-    if (!req.session || !req.session.token || !req.session.token.id) {
+    if (!req.session || !req.session.userId) {
         return res.status(401).json({ ok: false, error: 'Unauthorized' });
     }
 
     const { uri } = req.body;
-    const trackUri = uri; // URI of the currently playing track sent from frontend
-
-    console.log('=== SKIP REQUEST ===');
-    console.log('Track URI:', trackUri);
-    console.log('User ID:', req.session.token.id);
-    console.log('User:', req.session.user);
-
-    if (isOwner(req.session.token.id)) {
-        console.log('Owner detected - checking for shields');
-        try {
-            await ensureSpotifyAccessToken();
-
-            // Owner can skip, but still need to decrement shields if present
-            if (trackUri) {
-                console.log('Querying database for shields on:', trackUri);
-                // Check for skip shields
-                const trackMetadata = await new Promise((resolve, reject) => {
-                    db.get(
-                        'SELECT skip_shields FROM queue_metadata WHERE track_uri = ?',
-                        [trackUri],
-                        (err, row) => {
-                            if (err) reject(err);
-                            else resolve(row);
-                        }
-                    );
-                });
-
-                // If shields exist, decrement but still allow skip (owner bypass)
-                console.log('Track metadata:', trackMetadata);
-                if (trackMetadata && trackMetadata.skip_shields > 0) {
-                    const remainingShields = trackMetadata.skip_shields - 1;
-                    console.log(`SHIELD FOUND: ${trackMetadata.skip_shields} shields on track`);
-                    console.log('Decrementing shield count...');
-
-                    await new Promise((resolve, reject) => {
-                        db.run(
-                            'UPDATE queue_metadata SET skip_shields = skip_shields - 1 WHERE track_uri = ?',
-                            [trackUri],
-                            (err) => {
-                                if (err) reject(err);
-                                else resolve();
-                            }
-                        );
-                    });
-
-                    console.log(`Owner skip - shield decremented. ${remainingShields} remaining`);
-                } else {
-                    console.log('No shields found on track (owner skip)');
-                }
-            }
-
-            await executePlaybackModify(req, 'skip', () => spotifyApi.skipToNext());
-
-            // Update queueManager and broadcast to clients
-            const nextTrack = await queueManager.skipTrack(req.session.user || 'Teacher');
-            //console.log(`Skip successful for owner (ID: ${req.session.token.id})`);
-            res.json({ ok: true, currentTrack: nextTrack });
-            return;
-        } catch (error) {
-            console.error('Skip error:', error);
-            // Handle 404 errors when no active playback device
-            if (error.statusCode === 404) {
-                return res.status(400).json({ ok: false, error: 'No active Spotify playback found. Please start playing music on a Spotify device first.' });
-            }
-            return res.status(500).json({ ok: false, error: 'Failed to skip', details: error.message });
-        }
-    }
-
-    // For non-admin users, check if banned
-    const skipUserBanned = await new Promise((resolve, reject) => {
-        db.get("SELECT COALESCE(isBanned, 0) as isBanned FROM users WHERE id = ?", [req.session.token.id], (err, row) => {
-            if (err) reject(err);
-            else resolve(row && row.isBanned === 1);
-        });
-    });
-    if (skipUserBanned) {
-        return res.status(403).json({ ok: false, error: 'You have been banned from using Jukebar. Contact your teacher.' });
-    }
-
-    // For non-admin users, check payment and claim it
-    if (!req.session.hasPaid) {
-        //console.log('skip - Payment required. User ID:', req.session.token.id, 'hasPaid:', req.session.hasPaid);
-        return res.status(403).json({ ok: false, error: 'Payment required to skip' });
-    }
 
     try {
-        console.log('Regular user skip - payment confirmed');
         await ensureSpotifyAccessToken();
-
-        // Check if the track being skipped has skip shields
-        if (trackUri) {
-            console.log('Querying database for shields on:', trackUri);
-            // Query database for skip shields
-            const trackMetadata = await new Promise((resolve, reject) => {
-                db.get(
-                    'SELECT skip_shields FROM queue_metadata WHERE track_uri = ?',
-                    [trackUri],
-                    (err, row) => {
-                        if (err) reject(err);
-                        else resolve(row);
-                    }
-                );
-            });
-
-            console.log('Track metadata:', trackMetadata);
-            // If track has skip shields, block the skip and decrement shield count
-            if (trackMetadata && trackMetadata.skip_shields > 0) {
-                console.log(`SHIELD DETECTED: ${trackMetadata.skip_shields} shields - BLOCKING SKIP`);
-                console.log('User will be charged but skip will be blocked');
-                const shieldsThatBlockedSkip = trackMetadata.skip_shields;
-                const remainingShields = trackMetadata.skip_shields - 1;
-                console.log(`Decrementing shield: ${trackMetadata.skip_shields} -> ${remainingShields}`);
-
-                // Decrement shield count
-                await new Promise((resolve, reject) => {
-                    db.run(
-                        'UPDATE queue_metadata SET skip_shields = skip_shields - 1 WHERE track_uri = ?',
-                        [trackUri],
-                        (err) => {
-                            if (err) reject(err);
-                            else resolve();
-                        }
-                    );
-                });
-                console.log('Shield decremented in database');
-
-                // Play random blocked sound
-                const soundFile = playRandomBlockedSound();
-
-                // Get track details for logging
-                const currentPlayback = await executePlaybackRead(req, 'skip-currentTrack', () => spotifyApi.getMyCurrentPlayingTrack());
-                const trackName = currentPlayback.body?.item?.name || 'Unknown';
-                const artistName = currentPlayback.body?.item?.artists?.map(a => a.name).join(', ') || 'Unknown';
-
-                // Log the blocked skip transaction
-                await logTransaction({
-                    userID: req.session.token.id,
-                    displayName: req.session.user,
-                    action: 'skip_blocked',
-                    trackURI: trackUri,
-                    trackName: trackName,
-                    artistName: artistName,
-                    cost: Number(process.env.SKIP_AMOUNT) || 100
-                });
-
-                // Clear payment flag (they still paid but skip was blocked)
-                req.session.hasPaid = false;
-
-                // Broadcast updated queue to refresh shield count
-                await queueManager.syncWithSpotify(spotifyApi);
-                const skipEvent = {
-                    skippedBy: req.session.user || 'Someone',
-                    skippedAt: Date.now(),
-                    skippedType: 'shield',
-                    skippedTrack: { name: trackName }
-                };
-
-                queueManager.broadcastUpdate('skip', skipEvent);
-
-                console.log('Returning shield blocked response to client');
-                console.log(`Played sound: ${soundFile}`);
-                return req.session.save(() => {
-                    res.json({
-                        ok: false,
-                        shieldBlocked: true,
-                        remaining: remainingShields,
-                        soundPlayed: soundFile,
-                        message: `SKIP BLOCKED! This song is protected by ${shieldsThatBlockedSkip} shield${shieldsThatBlockedSkip !== 1 ? 's' : ''}. You were charged ${process.env.SKIP_AMOUNT || 100} digipogs.`
-                    });
-                });
-            } else {
-                console.log('No shields found - proceeding with skip');
-            }
-        } else {
-            console.log('No track URI provided - proceeding with skip anyway');
-        }
-
-        // No shields, proceed with skip
         await executePlaybackModify(req, 'skip', () => spotifyApi.skipToNext());
-
-        // Update queueManager and broadcast to clients
-        const nextTrack = await queueManager.skipTrack(req.session.user || 'Someone');
-
-        if (currentTrack) {
-            await logTransaction({
-                userID: req.session.token.id,
-                displayName: req.session.user,
-                action: 'skip',
-                trackURI: currentTrack.uri,
-                trackName: currentTrack.name,
-                artistName: currentTrack.artist,
-                cost: Number(process.env.SKIP_AMOUNT) || 100
-            });
-        }
-        // Clear payment flag after successful skip
-        req.session.hasPaid = false;
-        req.session.save(() => {
-            res.json({ ok: true, message: 'Track skipped and logged', currentTrack: nextTrack });
-        });
-
-
+        const nextTrack = await queueManager.skipTrack(req.session.user || 'Manager');
+        scheduleImmediateSpotifyQueueSync();
+        return res.json({ ok: true, currentTrack: nextTrack });
     } catch (error) {
         console.error('Skip error:', error);
-        // Handle 404 errors when no active playback device
         if (error.statusCode === 404) {
             return res.status(400).json({ ok: false, error: 'No active Spotify playback found. Please start playing music on a Spotify device first.' });
         }
-        res.status(500).json({ ok: false, error: 'Failed to skip', details: error.message });
+        return res.status(500).json({ ok: false, error: 'Failed to skip', details: error.message });
+    }
+});
+
+/** PUT /me/player/pause — https://developer.spotify.com/documentation/web-api/reference/pause-a-users-playback */
+router.post('/playback/pause', playbackRateLimit(MODIFY), async (req, res) => {
+    if (!req.session || !req.session.userId) {
+        return res.status(401).json({ ok: false, error: 'Unauthorized' });
+    }
+    try {
+        await ensureSpotifyAccessToken();
+        await executePlaybackModify(req, 'playback-pause', async () => {
+            const deviceId = await resolveSpotifyDeviceId(req);
+            const opts = deviceId ? { device_id: deviceId } : {};
+            await spotifyApi.pause(opts);
+        });
+        scheduleImmediateSpotifyQueueSync();
+        return res.json({ ok: true });
+    } catch (error) {
+        console.error('Pause error:', error);
+        const status = Number(error.statusCode ?? error?.body?.error?.status);
+        if (status === 404) {
+            return res.status(400).json({ ok: false, error: 'No active Spotify playback found. Please start playing music on a Spotify device first.' });
+        }
+        if (status === 403) {
+            return res.status(403).json({ ok: false, error: spotifyRestrictionErrorMessage() });
+        }
+        return res.status(500).json({ ok: false, error: 'Failed to pause', details: error.message });
+    }
+});
+
+/** PUT /me/player/play — https://developer.spotify.com/documentation/web-api/reference/start-a-users-playback */
+router.post('/playback/play', playbackRateLimit(MODIFY), async (req, res) => {
+    if (!req.session || !req.session.userId) {
+        return res.status(401).json({ ok: false, error: 'Unauthorized' });
+    }
+    try {
+        await ensureSpotifyAccessToken();
+        await executePlaybackModify(req, 'playback-play', async () => {
+            const deviceId = await resolveSpotifyDeviceId(req);
+            const playOptions = deviceId ? { device_id: deviceId } : {};
+
+            try {
+                await spotifyApi.play(playOptions);
+            } catch (err) {
+                const code = Number(err?.statusCode ?? err?.body?.error?.status);
+                // Resume often needs an explicit device; transfer + play covers stubborn clients.
+                if (code === 404 && deviceId) {
+                    await spotifyApi.transferMyPlayback([deviceId], { play: true });
+                    return;
+                }
+                throw err;
+            }
+        });
+        scheduleImmediateSpotifyQueueSync();
+        return res.json({ ok: true });
+    } catch (error) {
+        console.error('Play error:', error);
+        const status = Number(error.statusCode ?? error?.body?.error?.status);
+        if (status === 404) {
+            return res.status(400).json({ ok: false, error: 'No active Spotify playback found. Open Spotify on a device, then try again.' });
+        }
+        if (status === 403) {
+            return res.status(403).json({ ok: false, error: spotifyRestrictionErrorMessage() });
+        }
+        return res.status(500).json({ ok: false, error: 'Failed to start playback', details: error.message });
+    }
+});
+
+/** POST /me/player/previous — https://developer.spotify.com/documentation/web-api/reference/skip-users-playback-to-previous-track */
+router.post('/playback/previous', playbackRateLimit(MODIFY), async (req, res) => {
+    if (!req.session || !req.session.userId) {
+        return res.status(401).json({ ok: false, error: 'Unauthorized' });
+    }
+    try {
+        await ensureSpotifyAccessToken();
+        await executePlaybackModify(req, 'playback-previous', () => spotifyApi.skipToPrevious());
+        try {
+            await queueManager.syncWithSpotify(spotifyApi);
+        } catch (syncErr) {
+            console.warn('[playback/previous] queue sync:', syncErr.message);
+        }
+        return res.json({ ok: true, state: queueManager.getCurrentState() });
+    } catch (error) {
+        console.error('Previous track error:', error);
+        if (error.statusCode === 404) {
+            return res.status(400).json({ ok: false, error: 'No active Spotify playback found. Please start playing music on a Spotify device first.' });
+        }
+        return res.status(500).json({ ok: false, error: 'Failed to skip to previous track', details: error.message });
     }
 });
 
@@ -2064,8 +1697,8 @@ router.post('/queue/add', async (req, res) => {
         queueManager.addToQueue(track);
 
         // Log the transaction
-        if (req.session.token?.id) {
-            await logTransaction(req.session.token.id, username3, 'QUEUE', uri, trackName, artist, 50);
+        if (req.session?.userId) {
+            await logTransaction(req.session.userId, username3, 'QUEUE', uri, trackName, artist, 50);
         }
 
         res.json({ ok: true, message: 'Track added to queue', queue: queueManager.queue });
@@ -2079,7 +1712,7 @@ router.post('/queue/add', async (req, res) => {
 router.post('/queue/skip', playbackRateLimit(MODIFY), async (req, res) => {
     try {
         // Check permissions
-        if (req.session.permission < 4 && !isOwner(req.session.token?.id)) {
+        if (false) {
             return res.status(403).json({ ok: false, error: 'Insufficient permissions' });
         }
 
@@ -2132,264 +1765,6 @@ router.post('/checkTrackExists', isAuthenticated, async (req, res) => {
     }
 });
 
-router.post('/purchaseShield', isAuthenticated, async (req, res) => {
-    console.log('=== PURCHASE SHIELD REQUEST ===');
-    const { trackUri } = req.body;
-    const quantity = Math.max(1, Math.min(1000, parseInt(req.body.quantity) || 1));
-    const userId = req.session.token?.id;
-    const displayName = req.session.user;
-
-    console.log('Request body:', req.body);
-    console.log('User ID:', userId);
-    console.log('Display name:', displayName);
-    console.log('Track URI:', trackUri);
-
-    // Validation: Check authentication
-    if (!userId || !displayName) {
-        console.error('User not properly authenticated');
-        return res.status(401).json({ ok: false, error: 'User not authenticated' });
-    }
-
-    // Validation: Check track URI
-    if (!trackUri) {
-        console.error('Track URI missing from request');
-        return res.status(400).json({ ok: false, error: 'Track URI is required' });
-    }
-
-    // Owner bypass - they can add shields for free
-    const userIsOwner = isOwner(userId);
-    console.log('Is owner:', userIsOwner, '(userId:', userId, ')');
-
-    // Check if user is banned (non-owners only)
-    if (!userIsOwner) {
-        const shieldUserBanned = await new Promise((resolve, reject) => {
-            db.get("SELECT COALESCE(isBanned, 0) as isBanned FROM users WHERE id = ?", [userId], (err, row) => {
-                if (err) reject(err);
-                else resolve(row && row.isBanned === 1);
-            });
-        });
-        if (shieldUserBanned) {
-            return res.status(403).json({ ok: false, error: 'You have been banned from using Jukebar. Contact your teacher.' });
-        }
-    }
-
-    // Check payment FIRST before touching anything else
-    if (!userIsOwner) {
-        if (!req.session.hasPaid) {
-            console.error('Payment required but not received');
-            return res.status(402).json({ ok: false, error: 'Payment required' });
-        }
-        console.log('Payment verified');
-    } else {
-        console.log('Owner bypass - no payment required');
-    }
-
-    // Helper: consume hasPaid and attempt an automatic refund, then respond with the error
-    const failAndConsume = async (statusCode, payload) => {
-        req.session.hasPaid = false;
-        const lastPayment = req.session.payment;
-        const pin = process.env.PIN;
-        if (lastPayment && !lastPayment.refundedAt && lastPayment.amount > 0 && pin != null) {
-            try {
-                await poolRefund({
-                    from: Number(lastPayment.to),
-                    to: Number(lastPayment.from),
-                    amount: Number(lastPayment.amount),
-                    pin: Number(pin),
-                    reason: 'Jukebar refund - shield purchase failed'
-                });
-                req.session.payment.refundedAt = Date.now();
-                // console.log('[purchaseShield] Auto-refund issued for failed shield purchase');
-            } catch (refundErr) {
-                console.error('[purchaseShield] Auto-refund failed:', refundErr.message);
-            }
-        }
-        return req.session.save(() => res.status(statusCode).json(payload));
-    };
-
-    try {
-        // Step 1: Verify track exists in queue
-        console.log('Step 1: Checking if track exists in queue...');
-        let track = await new Promise((resolve, reject) => {
-            db.get("SELECT * FROM queue_metadata WHERE track_uri = ?" + (req.body.addedAt && req.body.addedAt !== '0' ? " AND added_at = ?" : ""),
-                req.body.addedAt && req.body.addedAt !== '0' ? [trackUri, req.body.addedAt] : [trackUri],
-                (err, row) => {
-                    if (err) {
-                        console.error('Database error querying queue_metadata:', err);
-                        reject(err);
-                    } else {
-                        console.log('Track found in queue:', row);
-                        resolve(row);
-                    }
-                });
-        });
-
-        // If not found in queue, try to find currently playing track's metadata
-        if (!track) {
-            console.warn('Track not found in queue, checking currently playing...');
-            const queueManager = require('../utils/queueManager');
-            const state = queueManager.getCurrentState();
-            const currentTrack = state.currentTrack;
-            if (currentTrack && currentTrack.uri === trackUri) {
-                // Find the metadata entry for the currently playing track (oldest matching entry)
-                track = await new Promise((resolve, reject) => {
-                    db.get("SELECT * FROM queue_metadata WHERE track_uri = ? ORDER BY added_at ASC LIMIT 1", [trackUri], (err, row) => {
-                        if (err) {
-                            console.error('Database error querying current track metadata:', err);
-                            reject(err);
-                        } else {
-                            console.log('Track found for currently playing:', row);
-                            resolve(row);
-                        }
-                    });
-                });
-                // If found, update shields for this metadata entry
-                if (track) {
-                    const updateResult = await new Promise((resolve, reject) => {
-                        db.run("UPDATE queue_metadata SET skip_shields = COALESCE(skip_shields, 0) + ? WHERE track_uri = ? AND added_at = ?", [quantity, trackUri, track.added_at], function (err) {
-                            if (err) {
-                                console.error('Database error updating shields for current track:', err);
-                                reject(err);
-                            } else {
-                                console.log('Shield count incremented for currently playing track at', track.added_at, '. Rows affected:', this.changes);
-                                resolve(this.changes);
-                            }
-                        });
-                    });
-                    if (updateResult === 0) {
-                        console.error('No rows updated for currently playing track');
-                        return failAndConsume(404, { ok: false, error: 'Track no longer in queue or playing' });
-                    }
-                } else {
-                    // No metadata entry exists for the currently playing track — create one with shields
-                    console.log('No metadata entry for currently playing track, creating one with', quantity, 'shields');
-                    const nowTs = Date.now();
-                    await new Promise((resolve, reject) => {
-                        db.run(
-                            `INSERT INTO queue_metadata (track_uri, added_by, added_at, display_name, is_anon, skip_shields) VALUES (?, ?, ?, ?, ?, ?)`,
-                            [trackUri, currentTrack.addedBy || 'spotify', nowTs, currentTrack.displayName || 'Spotify', currentTrack.isAnon ? 1 : 0, quantity],
-                            function (err) {
-                                if (err) {
-                                    console.error('Database error inserting metadata for current track:', err);
-                                    reject(err);
-                                } else {
-                                    console.log('Created metadata entry for currently playing track with', quantity, 'shields');
-                                    resolve(this.changes);
-                                }
-                            }
-                        );
-                    });
-                    track = {
-                        track_uri: trackUri,
-                        added_by: currentTrack.addedBy || 'spotify',
-                        added_at: nowTs,
-                        display_name: currentTrack.displayName || 'Spotify',
-                        is_anon: currentTrack.isAnon ? 1 : 0,
-                        skip_shields: quantity
-                    };
-                }
-            } else {
-                console.error('Track not found in queue or as currently playing');
-                return failAndConsume(404, { ok: false, error: 'Track not found in queue or playing' });
-            }
-        } else {
-            console.log('Track found:', track.track_name, 'by', track.artist_name);
-
-            // Check if track already has 1000 shields
-            const currentShields = track.skip_shields || 0;
-            if (currentShields >= 1000) {
-                console.log('Track already has max shields (1000)');
-                return failAndConsume(400, { ok: false, error: 'This song already has the maximum of 1000 shields and cannot have more added' });
-            }
-
-            // Check if adding the requested quantity would exceed 1000
-            if (currentShields + quantity > 1000) {
-                const availableSlots = 1000 - currentShields;
-                console.log(`Cannot add ${quantity} shields; only ${availableSlots} slots available`);
-                return failAndConsume(400, { ok: false, error: `This song already has ${currentShields} shields. You can only add ${availableSlots} more to reach the maximum of 1000` });
-            }
-
-            // Step 2: Update shield count for specific track instance
-            console.log('Step 2: Incrementing shield count...');
-            const addedAt = req.body.addedAt;
-            const updateResult = await new Promise((resolve, reject) => {
-                const query = addedAt && addedAt !== '0'
-                    ? "UPDATE queue_metadata SET skip_shields = COALESCE(skip_shields, 0) + ? WHERE track_uri = ? AND added_at = ?"
-                    : "UPDATE queue_metadata SET skip_shields = COALESCE(skip_shields, 0) + ? WHERE track_uri = ?";
-                const params = addedAt && addedAt !== '0' ? [quantity, trackUri, addedAt] : [quantity, trackUri];
-                db.run(query, params, function (err) {
-                    if (err) {
-                        console.error('Database error updating shields:', err);
-                        reject(err);
-                    } else {
-                        console.log('Shield count incremented for track at', addedAt || 'first instance', '. Rows affected:', this.changes);
-                        resolve(this.changes);
-                    }
-                });
-            });
-
-            if (updateResult === 0) {
-                console.error('No rows updated - track may have been removed from queue');
-                return failAndConsume(404, { ok: false, error: 'Track no longer in queue' });
-            }
-        }
-
-        // Step 3: Log transaction
-        console.log('Step 3: Logging transaction...');
-        try {
-            await logTransaction({
-                userID: userId,
-                displayName: displayName,
-                action: 'shield',
-                trackURI: trackUri,
-                trackName: track.track_name,
-                artistName: track.artist_name,
-                cost: userIsOwner ? 0 : (Number(process.env.SKIP_SHIELD_AMOUNT) || 75) * quantity
-            });
-            console.log('Transaction logged');
-        } catch (logErr) {
-            console.error('WARNING: Failed to log transaction (non-fatal):', logErr);
-            // Continue anyway - shield was added
-        }
-
-        // Step 4: Clear payment flag for non-owner
-        if (!userIsOwner) {
-            console.log('Step 4: Clearing payment flag...');
-            req.session.hasPaid = false;
-            console.log('Payment flag cleared');
-        }
-
-        // Step 5: Broadcast queue update
-        console.log('Step 5: Broadcasting queue update...');
-        try {
-            // Force re-sync from Spotify to get updated metadata
-            await queueManager.syncWithSpotify(spotifyApi);
-            console.log('Queue synced and broadcasted');
-        } catch (broadcastErr) {
-            console.error('WARNING: Failed to sync queue (non-fatal):', broadcastErr);
-            // Continue anyway - shield was added
-        }
-
-        // Step 6: Save session and respond
-        console.log('Step 6: Saving session and responding...');
-        req.session.save((saveErr) => {
-            if (saveErr) {
-                console.error('WARNING: Session save error (non-fatal):', saveErr);
-            }
-            console.log('Shield purchase complete!');
-            console.log('================================');
-            res.json({ ok: true, message: `${quantity > 1 ? quantity + ' shields' : 'Shield'} added successfully` });
-        });
-
-    } catch (error) {
-        console.error('FATAL ERROR in purchaseShield:', error);
-        console.error('Error stack:', error.stack);
-        console.log('================================');
-        res.status(500).json({ ok: false, error: 'Server error', details: error.message });
-    }
-});
-
-
 router.get('/api/currentTrack', playbackRateLimit(READ), async (req, res) => {
     try {
         await ensureSpotifyAccessToken();
@@ -2405,164 +1780,6 @@ router.get('/api/currentTrack', playbackRateLimit(READ), async (req, res) => {
     } catch (err) {
         console.error('Error fetching current track:', err);
         res.status(500).json({ error: 'Failed to fetch current track' });
-    }
-});
-
-// Spotify auth/permission diagnostic endpoint
-router.get('/diagnostics', isAuthenticated, requireTeacherAccess, async (req, res) => {
-    const results = {
-        timestamp: new Date().toISOString(),
-        tests: {}
-    };
-
-    // spotify-web-api-node WebapiError sets error.message = String(body) when the body
-    // object is passed directly to the Error constructor, producing "[object Object]".
-    // Fall through that sentinel and extract from error.body instead.
-    function extractErrMsg(error, fallback) {
-        const raw = error?.message;
-        if (typeof raw === 'string' && raw && raw !== '[object Object]') return raw;
-        // WebapiError stores the original response body in .body
-        const bodyMsg = error?.body?.error?.message;
-        if (typeof bodyMsg === 'string' && bodyMsg) return bodyMsg;
-        if (error?.body && typeof error.body === 'object') {
-            try {
-                const serialized = JSON.stringify(error.body);
-                if (serialized && serialized !== '{}' && serialized !== '[]') return serialized;
-            } catch { /* circular ref — ignore */ }
-        }
-        if (error?.statusCode) {
-            const retryAfter = error?.headers?.['retry-after'];
-            if (error.statusCode === 429) {
-                return retryAfter
-                    ? `Spotify rate limit hit (429). Retry after ${retryAfter}s.`
-                    : 'Spotify rate limit hit (429). Please wait and retry.';
-            }
-            return `Spotify returned HTTP ${error.statusCode}`;
-        }
-        return fallback;
-    }
-
-    try {
-        await ensureSpotifyAccessToken();
-
-        // Test 1: getMe - verify user access
-        // Note: the `product` field (Premium status) was removed from the User object for
-        // Development Mode apps in the February 2026 Spotify API changes.
-        try {
-            const me = await spotifyApi.getMe();
-            results.tests.userAccess = {
-                status: 'pass',
-                message: 'Successfully retrieved user info',
-                user: me.body?.display_name || 'Unknown',
-                note: 'Premium status cannot be verified via API for Development Mode apps (product field removed Feb 2026)'
-            };
-        } catch (error) {
-            results.tests.userAccess = {
-                status: 'fail',
-                message: extractErrMsg(error, 'Failed to get user info'),
-                statusCode: error.statusCode,
-                errorBody: error.body?.error || null
-            };
-        }
-
-        // Test 2: searchTracks - verify search scope
-        try {
-            const searchResult = await spotifyApi.searchTracks('test', { limit: 1 });
-            results.tests.searchScope = {
-                status: 'pass',
-                message: 'Search endpoint working',
-                totalResults: searchResult.body?.tracks?.total || 0
-            };
-        } catch (error) {
-            results.tests.searchScope = {
-                status: error.statusCode === 429 ? 'warning' : 'fail',
-                message: extractErrMsg(error, 'Search failed'),
-                statusCode: error.statusCode,
-                errorBody: error.body?.error || null
-            };
-        }
-
-        // Test 3: getTrack - verify track metadata access
-        try {
-            const trackResult = await spotifyApi.getTrack('3n3Ppam7vgaVa1iaRUc9Lp');
-            results.tests.trackLookup = {
-                status: 'pass',
-                message: 'Track lookup working',
-                track: trackResult.body?.name || 'Unknown',
-                hasImage: !!(trackResult.body?.album?.images?.length > 0)
-            };
-        } catch (error) {
-            results.tests.trackLookup = {
-                status: error.statusCode === 429 ? 'warning' : 'fail',
-                message: extractErrMsg(error, 'Track lookup failed'),
-                statusCode: error.statusCode,
-                note: error.statusCode === 429 ? 'Rate limited — app is making too many requests. Wait and retry.' : undefined,
-                errorBody: error.body?.error || null
-            };
-        }
-
-        // Test 4: getMyCurrentPlayingTrack - verify playback-state read scope
-        try {
-            const playback = await executePlaybackRead(req, 'diagnostics-playbackRead', () => spotifyApi.getMyCurrentPlayingTrack());
-            const isPlaying = !!playback.body?.item;
-            results.tests.playbackRead = {
-                status: 'pass',
-                message: 'Playback state readable',
-                isCurrentlyPlaying: isPlaying,
-                currentTrack: isPlaying ? playback.body.item.name : null
-            };
-        } catch (error) {
-            results.tests.playbackRead = {
-                status: error.statusCode === 429 ? 'warning' : 'fail',
-                message: extractErrMsg(error, 'Failed to read playback state'),
-                statusCode: error.statusCode,
-                errorBody: error.body?.error || null
-            };
-        }
-
-        // Test 5: addToQueue - verify playback-modify scope (dry-run check)
-        try {
-            // We won't actually add to queue, just check if the scope is available
-            // by attempting a getMyDevices call which requires user-read-playback-state
-            const deviceResult = await executePlaybackRead(req, 'diagnostics-playbackModifyCheck', () => spotifyApi.getMyDevices());
-            const hasDevice = (deviceResult.body?.devices?.length || 0) > 0;
-            results.tests.playbackModify = {
-                status: hasDevice ? 'pass' : 'warning',
-                message: hasDevice ? 'Playback modify scope available' : 'No active devices found',
-                activeDevices: deviceResult.body?.devices?.length || 0,
-                deviceNames: deviceResult.body?.devices?.map(d => d.name) || []
-            };
-        } catch (error) {
-            results.tests.playbackModify = {
-                status: error.statusCode === 429 ? 'warning' : 'fail',
-                message: extractErrMsg(error, 'Failed to check playback modify scope'),
-                statusCode: error.statusCode,
-                errorBody: error.body?.error || null
-            };
-        }
-
-        // Test 6: Summary
-        const passCount = Object.values(results.tests).filter(t => t.status === 'pass').length;
-        const failCount = Object.values(results.tests).filter(t => t.status === 'fail').length;
-        const warnCount = Object.values(results.tests).filter(t => t.status === 'warning').length;
-
-        results.summary = {
-            passed: passCount,
-            failed: failCount,
-            warnings: warnCount,
-            allPassed: failCount === 0,
-            recommendation: failCount > 0 
-                ? 'One or more tests failed. Check the details above. You may need to re-generate your refresh token with all required scopes.'
-                : warnCount > 0
-                ? 'All tests passed but some warnings detected. Check details above.'
-                : 'All tests passed. Spotify credentials appear to be working correctly.'
-        };
-
-        res.json(results);
-    } catch (error) {
-        console.error('Diagnostics endpoint error:', error);
-        results.error = error.message;
-        res.status(500).json(results);
     }
 });
 
@@ -2616,7 +1833,7 @@ router.get('/api/artist/:id/top-tracks', async (req, res) => {
                     .filter(t => (t.artists || []).some(a => a.id === id));
 
                 const match = candidates.find(
-                    t => !t.explicit && (t.duration_ms || 0) < 420000 && !isTrackBanned(t, bannedPairs)
+                    t => !isTrackBanned(t, bannedPairs)
                 );
                 if (!match) continue;
 
@@ -2709,8 +1926,6 @@ router.get('/api/album/:id/tracks', async (req, res) => {
         const filtered = [];
         for (const t of (albumData.tracks?.items || [])) {
             if (!t.uri || t.is_local) continue;
-            if ((t.duration_ms || 0) >= 420000) continue;
-            if (t.explicit) continue;
             if (isTrackBanned(t, bannedPairs)) continue;
             filtered.push({
                 id: t.id,
